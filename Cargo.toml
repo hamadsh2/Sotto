@@ -26,6 +26,7 @@ directories = "6"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "0.8"
 global-hotkey = "0.10.0"
+self_update = { version = "1.3.3", default-features = false, features = ["ureq", "rustls", "github", "archive-zip", "compression-zip-deflate", "signatures"] }
 
 # Keep the default panic = "unwind": devices::no_panic relies on it to survive
 # cpal panicking when a device is unplugged mid-call. Do not set panic = "abort".

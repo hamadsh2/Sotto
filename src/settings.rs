@@ -57,6 +57,8 @@ pub struct Settings {
     pub start_with_windows: bool,
     /// Global mute shortcut as text, e.g. "Ctrl+Alt+M"; empty = none.
     pub mute_hotkey: String,
+    /// Look for a new Sotto at startup and once a day (installing always asks first).
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -79,6 +81,7 @@ impl Default for Settings {
             dfn_postfilter: false,
             start_with_windows: false,
             mute_hotkey: MUTE_HOTKEY_DEFAULT.into(),
+            check_updates: true,
         };
         // One source of truth for the defaults: a fresh `Params`.
         s.read_params(&p);
@@ -244,6 +247,7 @@ mod tests {
         assert!(s.hpf && s.eq && s.gate && s.agc && s.limiter);
         assert!(!s.dfn_postfilter && !s.start_with_windows);
         assert_eq!(s.mute_hotkey, MUTE_HOTKEY_DEFAULT);
+        assert!(s.check_updates);
         assert!(s.input.is_none() && s.output.is_none());
     }
 
@@ -266,6 +270,7 @@ mod tests {
             dfn_postfilter: true,
             start_with_windows: true,
             mute_hotkey: "Shift+F9".into(),
+            check_updates: false,
             ..Settings::default()
         };
         save(&path, &s).unwrap();

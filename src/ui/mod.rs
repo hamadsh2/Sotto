@@ -9,6 +9,9 @@
 //!   refresh skips its redraw, so nothing is drawn and the GPU stays idle.
 //! - Only "Quit Sotto" in the tray ends the program.
 //!
+//! Updates (`update.rs`): checked 20 s after start and then daily if allowed; installed
+//! only when the user clicks Install; "Restart" quits cleanly and starts the new exe.
+//!
 //! Settings: loaded from `%APPDATA%\Sotto\settings.toml` before the audio starts, and
 //! saved half a second after the last change (and once more on quit).
 
@@ -21,10 +24,12 @@ mod mark;
 mod meter;
 mod theme;
 mod tray;
+mod update;
 mod win;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -45,6 +50,27 @@ use main_window::MainWindow;
 const SAVE_AFTER: Duration = Duration::from_millis(500);
 /// How often to check whether the taskbar switched between light and dark.
 const THEME_EVERY: Duration = Duration::from_secs(5);
+/// First automatic update check after start (not at the very first second: at sign-in
+/// Windows is busy and the network may not be up yet), then once a day.
+const UPDATE_FIRST: Duration = Duration::from_secs(20);
+const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Set by "Restart" after an update: once the app has quit, start the new exe.
+static RESTART: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+
+/// Where the update stands, for the window and the tray.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(String),
+    Installing(String),
+    /// Installed; takes effect after a restart.
+    Ready(String),
+    Failed(String),
+}
 
 struct AppState {
     audio: Audio,
@@ -66,6 +92,7 @@ struct AppState {
     hotkeys: Option<hotkey::Hotkeys>,
     /// Why the saved/chosen shortcut couldn't be used, for the window.
     hotkey_error: Option<String>,
+    update: UpdateState,
 }
 
 impl Global for AppState {}
@@ -161,6 +188,7 @@ pub fn run() {
                 autostart,
                 hotkeys,
                 hotkey_error,
+                update: UpdateState::Idle,
             });
             if show {
                 open_main(cx);
@@ -173,6 +201,30 @@ pub fn run() {
                     let alive = cx.update(|cx| {
                         if let Some(t) = &cx.global::<AppState>().tray {
                             tray::follow_theme(t);
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+            // Automatic update checks (only if allowed; installing always needs a click).
+            cx.spawn(async move |cx| {
+                let mut wait = UPDATE_FIRST;
+                loop {
+                    cx.background_executor().timer(wait).await;
+                    wait = UPDATE_EVERY;
+                    let alive = cx.update(|cx| {
+                        let st = cx.global::<AppState>();
+                        let busy = matches!(
+                            st.update,
+                            UpdateState::Checking
+                                | UpdateState::Installing(_)
+                                | UpdateState::Ready(_)
+                        );
+                        if st.settings.check_updates && !busy {
+                            check_updates(cx);
                         }
                     });
                     if alive.is_err() {
@@ -198,19 +250,94 @@ pub fn run() {
                 .detach();
             }
         });
+
+    // The app has quit. After an update, start the new version — once this one has
+    // let go of the single-instance lock, so the new one doesn't think Sotto is running.
+    if RESTART.load(Relaxed) {
+        drop(_claim);
+        update::relaunch();
+    }
 }
 
 fn on_tray(action: tray::Action, cx: &mut App) {
     match action {
         tray::Action::Open => open_main(cx),
         tray::Action::ToggleMute => toggle_mute(cx),
-        tray::Action::Quit => {
-            save_now(cx);
-            // Stop streams and the engine cleanly before the program ends.
-            cx.global_mut::<AppState>().audio.stop();
-            cx.quit();
-        }
+        tray::Action::Quit => quit(cx),
     }
+}
+
+/// Save, stop the streams and the engine cleanly, and end the program.
+fn quit(cx: &mut App) {
+    save_now(cx);
+    cx.global_mut::<AppState>().audio.stop();
+    cx.quit();
+}
+
+fn set_update(cx: &mut App, state: UpdateState) {
+    let st = cx.global_mut::<AppState>();
+    st.update = state;
+    if let Some(t) = &st.tray {
+        let available = match &st.update {
+            UpdateState::Available(v) | UpdateState::Ready(v) => Some(v.as_str()),
+            _ => None,
+        };
+        tray::set_update(t, available);
+    }
+    cx.refresh_windows();
+}
+
+/// Ask GitHub whether a newer Sotto exists (on a background thread).
+pub fn check_updates(cx: &mut App) {
+    set_update(cx, UpdateState::Checking);
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async { update::check() })
+            .await;
+        let _ = cx.update(|cx| {
+            set_update(
+                cx,
+                match result {
+                    Ok(Some(v)) => UpdateState::Available(v),
+                    Ok(None) => UpdateState::UpToDate,
+                    Err(e) => UpdateState::Failed(e),
+                },
+            )
+        });
+    })
+    .detach();
+}
+
+/// Download, verify and install the available version (only ever from a click).
+pub fn install_update(cx: &mut App) {
+    let UpdateState::Available(v) = cx.global::<AppState>().update.clone() else {
+        return;
+    };
+    set_update(cx, UpdateState::Installing(v.clone()));
+    cx.spawn(async move |cx| {
+        let ver = v.clone();
+        let result = cx
+            .background_executor()
+            .spawn(async move { update::install(&ver) })
+            .await;
+        let _ = cx.update(|cx| {
+            set_update(
+                cx,
+                match result {
+                    Ok(()) => UpdateState::Ready(v),
+                    Err(e) => UpdateState::Failed(e),
+                },
+            )
+        });
+    })
+    .detach();
+}
+
+/// Quit and start the updated Sotto.
+pub fn restart(cx: &mut App) {
+    RESTART.store(true, Relaxed);
+    quit(cx);
 }
 
 /// Mute or unmute (tray, shortcut or window). The audio fades in 10 ms; the tray glyph

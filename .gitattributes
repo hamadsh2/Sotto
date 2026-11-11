@@ -1,0 +1,7 @@
+# Binary files: never convert line endings (a changed byte breaks the update key,
+# the signed test zips, fonts and icons).
+*.pub binary
+*.zip binary
+*.ttf binary
+*.ico binary
+*.png binary

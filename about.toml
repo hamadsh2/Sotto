@@ -21,7 +21,7 @@ accepted = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "Unlicense",
-    "CDLA-Permissive-2.0",
+    "CDLA-Permissive-2.0",  # webpki-roots (HTTPS root certificates, data); approved 2026-11-11
     "OFL-1.1",
     "GPL-3.0-only",
 ]

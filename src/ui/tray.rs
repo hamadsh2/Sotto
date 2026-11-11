@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Tray icon with "Open Sotto", "Mute" and "Quit Sotto".
+//! Tray icon with "Open Sotto", "Mute" and "Quit Sotto" (plus an "Update available"
+//! item when there is one).
 //!
 //! tray-icon reports clicks through a callback that Windows calls on the main thread
 //! (the same thread as the UI). The callback doesn't touch the UI directly: it schedules
@@ -25,6 +26,7 @@ pub enum Action {
 
 const OPEN_ID: &str = "open";
 const MUTE_ID: &str = "mute";
+const UPDATE_ID: &str = "update";
 const QUIT_ID: &str = "quit";
 
 /// The UI app and the action handler.
@@ -36,6 +38,12 @@ thread_local! {
     static APP: RefCell<Option<Handler>> = const { RefCell::new(None) };
     /// The "Mute" / "Unmute" menu item, to relabel it.
     static MUTE_ITEM: RefCell<Option<MenuItem>> = const { RefCell::new(None) };
+    /// The menu, to add or remove the "Update available" item.
+    static MENU: RefCell<Option<Menu>> = const { RefCell::new(None) };
+    /// The "Update available" item while it's in the menu.
+    static UPDATE_ITEM: RefCell<Option<MenuItem>> = const { RefCell::new(None) };
+    /// Shown in the tooltip when not muted: a newer Sotto is available or installed.
+    static UPDATE_TIP: Cell<bool> = const { Cell::new(false) };
     /// What the icon currently shows: (light taskbar, muted).
     static SHOWN: Cell<(bool, bool)> = const { Cell::new((false, false)) };
 }
@@ -58,7 +66,7 @@ pub fn build(cx: &mut App, on_action: fn(Action, &mut App)) -> Result<TrayIcon, 
     APP.with(|a| *a.borrow_mut() = Some((cx.to_async(), on_action)));
 
     MenuEvent::set_event_handler(Some(|e: MenuEvent| match e.id.0.as_str() {
-        OPEN_ID => dispatch(Action::Open),
+        OPEN_ID | UPDATE_ID => dispatch(Action::Open),
         MUTE_ID => dispatch(Action::ToggleMute),
         QUIT_ID => dispatch(Action::Quit),
         _ => {}
@@ -84,6 +92,7 @@ pub fn build(cx: &mut App, on_action: fn(Action, &mut App)) -> Result<TrayIcon, 
     ])
     .map_err(|e| e.to_string())?;
     MUTE_ITEM.with(|m| *m.borrow_mut() = Some(mute));
+    MENU.with(|m| *m.borrow_mut() = Some(menu.clone()));
 
     let light = win::taskbar_is_light();
     SHOWN.with(|s| s.set((light, false)));
@@ -103,9 +112,50 @@ pub fn set_muted(tray: &TrayIcon, muted: bool) {
             item.set_text(if muted { "Unmute" } else { "Mute" });
         }
     });
-    let _ = tray.set_tooltip(Some(if muted { "Sotto — muted" } else { "Sotto" }));
+    set_tooltip(tray, muted);
     let light = SHOWN.with(|s| s.get().0);
     redraw(tray, light, muted);
+}
+
+fn set_tooltip(tray: &TrayIcon, muted: bool) {
+    let tip = if muted {
+        "Sotto — muted"
+    } else if UPDATE_TIP.with(|u| u.get()) {
+        "Sotto — update available"
+    } else {
+        "Sotto"
+    };
+    let _ = tray.set_tooltip(Some(tip));
+}
+
+/// Show (Some(version)) or remove the "Update available" menu item. Clicking it opens
+/// the window, where the user decides.
+pub fn set_update(tray: &TrayIcon, version: Option<&str>) {
+    UPDATE_TIP.with(|u| u.set(version.is_some()));
+    MENU.with(|m| {
+        let menu = m.borrow();
+        let Some(menu) = menu.as_ref() else { return };
+        UPDATE_ITEM.with(|i| {
+            let mut item = i.borrow_mut();
+            match (version, item.as_ref()) {
+                (Some(v), Some(it)) => it.set_text(format!("Sotto {v} is available")),
+                (Some(v), None) => {
+                    let it =
+                        MenuItem::with_id(UPDATE_ID, format!("Sotto {v} is available"), true, None);
+                    if menu.insert(&it, 0).is_ok() {
+                        *item = Some(it);
+                    }
+                }
+                (None, Some(it)) => {
+                    let _ = menu.remove(it);
+                    *item = None;
+                }
+                (None, None) => {}
+            }
+        });
+    });
+    let muted = SHOWN.with(|s| s.get().1);
+    set_tooltip(tray, muted);
 }
 
 /// Follow Windows switching between a light and a dark taskbar. Cheap (one registry

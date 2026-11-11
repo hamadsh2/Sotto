@@ -45,7 +45,9 @@ use super::audio::{Command, Device, State, Status};
 use super::licenses::{self, License};
 use super::meter::{self, Meter};
 use super::theme::*;
-use super::{AppState, hotkey, save_soon, toggle_mute};
+use super::{
+    AppState, UpdateState, check_updates, hotkey, install_update, restart, save_soon, toggle_mute,
+};
 
 /// Meter frame interval while visible (~30 Hz).
 const METER_EVERY: Duration = Duration::from_millis(33);
@@ -1129,6 +1131,112 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// "Check for updates automatically" (at start and once a day).
+    fn auto_update_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = cx.global::<AppState>().settings.check_updates;
+        div()
+            .flex()
+            .items_center()
+            .gap(SP_12)
+            .py(SP_12)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child("Check for updates")
+                    .child(caption("Daily. Installing always asks you first.")),
+            )
+            .child(
+                div().flex_none().cursor_pointer().child(
+                    Switch::new("check-updates")
+                        .checked(on)
+                        .on_click(|checked: &bool, _, cx| {
+                            cx.global_mut::<AppState>().settings.check_updates = *checked;
+                            save_soon(cx);
+                            cx.refresh_windows();
+                        }),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// Where the update stands, with the one button that fits: Check, Install, Restart.
+    fn update_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let state = cx.global::<AppState>().update.clone();
+        let current = super::update::current_version();
+        let (title, hint, button): (SharedString, SharedString, UpdateButton) = match &state {
+            UpdateState::Idle => (
+                format!("Sotto {current}").into(),
+                "Not checked yet".into(),
+                Some(("Check now", check_updates)),
+            ),
+            UpdateState::Checking => (
+                format!("Sotto {current}").into(),
+                "Checking for updates…".into(),
+                None,
+            ),
+            UpdateState::UpToDate => (
+                format!("Sotto {current}").into(),
+                "You have the latest version".into(),
+                Some(("Check now", check_updates)),
+            ),
+            UpdateState::Available(v) => (
+                format!("Sotto {v} is available").into(),
+                format!("You have {current}. Signed and checked before installing.").into(),
+                Some(("Install", install_update)),
+            ),
+            UpdateState::Installing(v) => (
+                format!("Installing Sotto {v}…").into(),
+                "Downloading and checking the signature".into(),
+                None,
+            ),
+            UpdateState::Ready(v) => (
+                format!("Sotto {v} is installed").into(),
+                "Restart Sotto to start using it".into(),
+                Some(("Restart", restart)),
+            ),
+            UpdateState::Failed(why) => (
+                format!("Sotto {current}").into(),
+                why.clone().into(),
+                Some(("Try again", check_updates)),
+            ),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(SP_12)
+            .py(SP_12)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(title)
+                    .child(caption(hint)),
+            )
+            .when_some(button, |d, (label, action)| {
+                d.child(
+                    div()
+                        .id("update-action")
+                        .flex_none()
+                        .px(SP_12)
+                        .py(SP_4)
+                        .rounded(RADIUS_CONTROL)
+                        .border_1()
+                        .border_color(c(BORDER))
+                        .text_size(px(LABEL))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(c(ELEVATED)))
+                        .child(label)
+                        .on_click(move |_: &ClickEvent, _, cx| action(cx)),
+                )
+            })
+            .into_any_element()
+    }
+
     /// "About Sotto": opens the About page.
     fn about_row(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
@@ -1297,6 +1405,9 @@ fn segmented(
 }
 
 /// A panel on `surface` with a small label on top.
+/// The update row's button: its label and what it does.
+type UpdateButton = Option<(&'static str, fn(&mut App))>;
+
 const REPO_URL: &str = "https://github.com/hamadsh2/Sotto";
 
 /// The scrolling window background with the app font and text defaults. Each page has
@@ -1627,7 +1738,12 @@ impl Render for MainWindow {
                 .child(list_card(devices))
                 .child(list_card(chain))
                 .child(list_card(vec![self.mute_row(), self.shortcut_row(cx)]))
-                .child(list_card(vec![self.startup_row(cx), self.about_row(cx)]))
+                .child(list_card(vec![
+                    self.startup_row(cx),
+                    self.auto_update_row(cx),
+                    self.update_row(cx),
+                    self.about_row(cx),
+                ]))
                 .child(
                     div()
                         .flex()
