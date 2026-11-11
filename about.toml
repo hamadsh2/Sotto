@@ -1,0 +1,27 @@
+# cargo-about: which licenses Sotto's dependencies may use (all GPL-3.0-compatible).
+# Generate the list shown in Sotto's About page with:
+#   cargo about generate about.hbs -o assets/THIRD_PARTY_LICENSES.txt
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+private = { ignore = true }
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "Zlib",
+    "BSL-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    "GPL-3.0-only",
+]

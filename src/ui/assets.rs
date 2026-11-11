@@ -6,7 +6,8 @@
 //! "icons/chevron-down.svg"). Python analogy: a dict `{path: bytes}` filled at build
 //! time by `include_bytes!` and looked up on demand.
 //!
-//! Icons are Lucide (ISC license; notice in `assets/icons/LICENSE-lucide.txt`).
+//! Icons are Lucide (ISC license; notice in `assets/icons/LICENSE-lucide.txt`). The font
+//! is Inter (SIL Open Font License 1.1; `assets/fonts/LICENSE-Inter.txt`).
 
 use std::borrow::Cow;
 
@@ -17,12 +18,24 @@ pub const MARK: &str = "icon/sotto-mark.svg";
 pub const MIC: &str = "icons/mic.svg";
 pub const PLUG: &str = "icons/plug.svg";
 pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
+pub const CHEVRON_LEFT: &str = "icons/chevron-left.svg";
 pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
+
+/// Inter in the three weights the design uses (400 body, 500 labels, 600 headings).
+pub const FONTS: [&[u8]; 3] = [
+    include_bytes!("../../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../../assets/fonts/Inter-Medium.ttf"),
+    include_bytes!("../../assets/fonts/Inter-SemiBold.ttf"),
+];
 
 const FILES: &[(&str, &[u8])] = &[
     (MARK, include_bytes!("../../assets/icon/sotto-mark.svg")),
     (MIC, include_bytes!("../../assets/icons/mic.svg")),
     (PLUG, include_bytes!("../../assets/icons/plug.svg")),
+    (
+        CHEVRON_LEFT,
+        include_bytes!("../../assets/icons/chevron-left.svg"),
+    ),
     (
         CHEVRON_RIGHT,
         include_bytes!("../../assets/icons/chevron-right.svg"),

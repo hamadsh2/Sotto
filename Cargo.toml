@@ -25,6 +25,7 @@ tray-icon = "0.26.1"
 directories = "6"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "0.8"
+global-hotkey = "0.10.0"
 
 # Keep the default panic = "unwind": devices::no_panic relies on it to survive
 # cpal panicking when a device is unplugged mid-call. Do not set panic = "abort".

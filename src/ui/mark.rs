@@ -19,6 +19,8 @@ pub enum Style {
     App,
     /// The tray glyph: the mark alone on transparent, in the given colour.
     Tray([u8; 3]),
+    /// The tray glyph while muted: the wave fully flat, crossed by a short slash.
+    TrayMuted([u8; 3]),
 }
 
 const BG: [u8; 3] = [0x1C, 0x1B, 0x1A];
@@ -95,17 +97,26 @@ pub fn render(size: u32, style: Style) -> Vec<u8> {
     let span = match style {
         Style::App if simple => 0.74,
         Style::App => 0.60,
-        Style::Tray(_) => 0.92,
+        Style::Tray(_) | Style::TrayMuted(_) => 0.92,
     };
     // 20 units (x 2..22) plus the round caps map onto `span` of the canvas.
     let scale = n * span / 22.0;
     let stroke = (2.0 * scale).max(if simple { 1.7 } else { 0.0 });
     let half = stroke / 2.0;
     let to_px = |(x, y): P| (n / 2.0 + (x - 12.0) * scale, n / 2.0 + (y - 12.0) * scale);
-    let line: Vec<P> = polyline(simple).into_iter().map(to_px).collect();
+    let lines: Vec<Vec<P>> = match style {
+        Style::TrayMuted(_) => vec![
+            vec![(2.0, 12.0), (22.0, 12.0)],
+            vec![(7.5, 19.0), (16.5, 5.0)],
+        ],
+        _ => vec![polyline(simple)],
+    }
+    .into_iter()
+    .map(|l| l.into_iter().map(to_px).collect())
+    .collect();
     let (ink, bg) = match style {
         Style::App => (SAGE, Some(BG)),
-        Style::Tray(c) => (c, None),
+        Style::Tray(c) | Style::TrayMuted(c) => (c, None),
     };
 
     let mut out = vec![0u8; (size * size * 4) as usize];
@@ -118,8 +129,9 @@ pub fn render(size: u32, style: Style) -> Vec<u8> {
                 None => 0.0,
             };
             // Stroke coverage: distance to the nearest piece of the wave.
-            let d = line
-                .windows(2)
+            let d = lines
+                .iter()
+                .flat_map(|l| l.windows(2))
                 .map(|s| dist_to_segment(p, s[0], s[1]))
                 .fold(f32::MAX, f32::min);
             let ink_a = (half + 0.5 - d).clamp(0.0, 1.0);
@@ -157,6 +169,16 @@ mod tests {
         // The flat line on the right is sage, on the centre row.
         let i = ((32 * 64 + 44) * 4) as usize;
         assert_eq!(&img[i..i + 3], &SAGE);
+    }
+
+    #[test]
+    fn muted_glyph_is_flat_with_a_slash() {
+        let img = render(32, Style::TrayMuted([0xE8, 0xE4, 0xDC]));
+        // The flat line crosses the left edge area, where the normal wave would be
+        // above or below the centre.
+        assert!((4..8).all(|x| alpha(&img, 32, x, 16) == 255));
+        // The slash reaches well above the line.
+        assert!((0..32).any(|x| alpha(&img, 32, x, 8) > 200));
     }
 
     #[test]

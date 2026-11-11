@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use crate::control::EngineKind;
 use crate::params::{EqPreset, Params};
 
+/// The mute shortcut until the user picks another.
+pub const MUTE_HOTKEY_DEFAULT: &str = "Ctrl+Shift+F9";
+
 /// A device the user chose: its Windows endpoint ID and its full name. The name is used
 /// only if the ID changed (e.g. the mic moved to another USB port) and must match
 /// exactly — never a partial match, never another device.
@@ -52,6 +55,8 @@ pub struct Settings {
     pub limiter: bool,
     pub dfn_postfilter: bool,
     pub start_with_windows: bool,
+    /// Global mute shortcut as text, e.g. "Ctrl+Alt+M"; empty = none.
+    pub mute_hotkey: String,
 }
 
 impl Default for Settings {
@@ -73,6 +78,7 @@ impl Default for Settings {
             limiter: false,
             dfn_postfilter: false,
             start_with_windows: false,
+            mute_hotkey: MUTE_HOTKEY_DEFAULT.into(),
         };
         // One source of truth for the defaults: a fresh `Params`.
         s.read_params(&p);
@@ -237,6 +243,7 @@ mod tests {
         assert_eq!(s.eq_preset(), EqPreset::Natural);
         assert!(s.hpf && s.eq && s.gate && s.agc && s.limiter);
         assert!(!s.dfn_postfilter && !s.start_with_windows);
+        assert_eq!(s.mute_hotkey, MUTE_HOTKEY_DEFAULT);
         assert!(s.input.is_none() && s.output.is_none());
     }
 
@@ -258,6 +265,7 @@ mod tests {
             limiter: false,
             dfn_postfilter: true,
             start_with_windows: true,
+            mute_hotkey: "Shift+F9".into(),
             ..Settings::default()
         };
         save(&path, &s).unwrap();

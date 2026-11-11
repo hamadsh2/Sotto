@@ -44,9 +44,24 @@ pub const SP_24: Pixels = px(24.0);
 pub const RADIUS_CONTROL: Pixels = px(8.0);
 pub const RADIUS_PANEL: Pixels = px(12.0);
 
-/// Font. Inter (embedded) arrives with the branding step; Segoe UI is Windows' own UI
-/// font and needs nothing bundled.
-pub const FONT: &str = "Segoe UI";
+/// Font: Inter, embedded in the exe (`assets.rs`), registered at start by `load_fonts`.
+pub const FONT: &str = "Inter";
+
+/// Make Inter available to the window. If Windows can't load it, text falls back to the
+/// system font; nothing else changes.
+pub fn load_fonts(cx: &mut App) {
+    let fonts = super::assets::FONTS
+        .iter()
+        .map(|b| std::borrow::Cow::Borrowed(*b))
+        .collect();
+    let _ = cx.text_system().add_fonts(fonts);
+}
+
+/// Tabular numerals ("tnum"): every digit is equally wide, so CPU %, dB and ms
+/// readouts don't jitter as they change. Set once on the window's root; it cascades.
+pub fn tabular_numbers() -> gpui::FontFeatures {
+    gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]))
+}
 
 /// Point gpui-component's theme at our tokens.
 pub fn apply(cx: &mut App) {

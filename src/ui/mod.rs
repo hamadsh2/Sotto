@@ -14,6 +14,8 @@
 
 mod assets;
 mod audio;
+mod hotkey;
+mod licenses;
 mod main_window;
 mod mark;
 mod meter;
@@ -41,6 +43,8 @@ use main_window::MainWindow;
 /// Wait this long after the last change before writing the settings file, so dragging
 /// a slider writes once, not sixty times a second.
 const SAVE_AFTER: Duration = Duration::from_millis(500);
+/// How often to check whether the taskbar switched between light and dark.
+const THEME_EVERY: Duration = Duration::from_secs(5);
 
 struct AppState {
     audio: Audio,
@@ -58,6 +62,10 @@ struct AppState {
     save_task: Option<Task<()>>,
     /// Whether Sotto's "Start with Windows" entry exists (the registry is the truth).
     autostart: bool,
+    /// The global mute shortcut (`None` if Windows wouldn't give us one at all).
+    hotkeys: Option<hotkey::Hotkeys>,
+    /// Why the saved/chosen shortcut couldn't be used, for the window.
+    hotkey_error: Option<String>,
 }
 
 impl Global for AppState {}
@@ -127,11 +135,17 @@ pub fn run() {
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            theme::load_fonts(cx);
             theme::apply(cx);
 
             let visible = Arc::new(AtomicBool::new(!hidden));
             let audio = Audio::spawn(choice, params, Arc::clone(&visible));
             let tray = tray::build(cx, on_tray).ok();
+            let mut hotkeys = hotkey::Hotkeys::new();
+            let hotkey_error = match &mut hotkeys {
+                Some(h) => h.set(Some(s.mute_hotkey.as_str())).err(),
+                None => Some("Windows didn't allow a global shortcut.".into()),
+            };
             // Without a tray there would be no way to open a hidden window.
             let show = !hidden || tray.is_none();
             cx.set_global(AppState {
@@ -145,10 +159,28 @@ pub fn run() {
                 settings_path,
                 save_task: None,
                 autostart,
+                hotkeys,
+                hotkey_error,
             });
             if show {
                 open_main(cx);
             }
+            // Follow Windows switching between a light and a dark taskbar (one small
+            // registry read every 5 s; redraws the tray glyph only if it changed).
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor().timer(THEME_EVERY).await;
+                    let alive = cx.update(|cx| {
+                        if let Some(t) = &cx.global::<AppState>().tray {
+                            tray::follow_theme(t);
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
             // Wait (off the UI thread, in the kernel: no CPU) for a second copy to ask
             // us to show the window.
             if let Some(signal) = show_signal {
@@ -171,6 +203,7 @@ pub fn run() {
 fn on_tray(action: tray::Action, cx: &mut App) {
     match action {
         tray::Action::Open => open_main(cx),
+        tray::Action::ToggleMute => toggle_mute(cx),
         tray::Action::Quit => {
             save_now(cx);
             // Stop streams and the engine cleanly before the program ends.
@@ -178,6 +211,18 @@ fn on_tray(action: tray::Action, cx: &mut App) {
             cx.quit();
         }
     }
+}
+
+/// Mute or unmute (tray, shortcut or window). The audio fades in 10 ms; the tray glyph
+/// and the window follow.
+pub fn toggle_mute(cx: &mut App) {
+    let st = cx.global::<AppState>();
+    let muted = !st.audio.params.muted.load(Relaxed);
+    st.audio.params.muted.store(muted, Relaxed);
+    if let Some(t) = &st.tray {
+        tray::set_muted(t, muted);
+    }
+    cx.refresh_windows();
 }
 
 /// Something the user can change was changed: save shortly.

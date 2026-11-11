@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! The main window: engine selector, strength, level meters, device pickers, the
 //! voice-chain switches (with fine settings that open under their row), warnings, and
-//! a CPU · latency readout.
+//! a CPU · latency readout. "About Sotto" near the bottom swaps in the About page (version,
+//! license, third-party licenses) in the same window.
 //!
 //! How the controls reach the audio (see `audio.rs`):
 //! - strength, the stage switches and their fine settings write `Params` atomics
@@ -23,9 +24,9 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, Div, Entity, FontWeight, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, div, px, relative, svg,
+    AnyElement, App, AppContext, ClickEvent, Context, Div, Entity, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px, relative, svg,
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
@@ -41,9 +42,10 @@ use sotto::stats;
 
 use super::assets;
 use super::audio::{Command, Device, State, Status};
+use super::licenses::{self, License};
 use super::meter::{self, Meter};
 use super::theme::*;
-use super::{AppState, save_soon};
+use super::{AppState, hotkey, save_soon, toggle_mute};
 
 /// Meter frame interval while visible (~30 Hz).
 const METER_EVERY: Duration = Duration::from_millis(33);
@@ -218,6 +220,17 @@ pub struct MainWindow {
     /// The value being typed in (one at a time) and its text box.
     editing: Option<Field>,
     edit: Entity<InputState>,
+    /// Recording a new mute shortcut: the box has keyboard focus and the old shortcut
+    /// is paused.
+    recording: bool,
+    rec_focus: FocusHandle,
+    /// Why the last pressed shortcut wasn't accepted.
+    rec_error: Option<String>,
+    /// The About page is shown instead of the controls.
+    about: bool,
+    /// The license opened on the About page (0 = Sotto's own, n = third-party n-1) and
+    /// its text reflowed for the window's width.
+    open_license: Option<(usize, SharedString)>,
     meter_in: Meter,
     meter_out: Meter,
     cpu_pct: f64,
@@ -335,8 +348,9 @@ impl MainWindow {
                         last_sample = now;
                         this.sample();
                     }
-                    if !visible.load(Relaxed) {
-                        // Hidden: forget the levels so the meters start from rest.
+                    if !visible.load(Relaxed) || this.about {
+                        // Hidden (or the About page, which has no meters or readouts):
+                        // forget the levels so the meters start from rest, and don't draw.
                         this.meter_in.reset();
                         this.meter_out.reset();
                         return;
@@ -371,6 +385,11 @@ impl MainWindow {
             autostart_error: None,
             editing: None,
             edit,
+            recording: false,
+            rec_focus: cx.focus_handle(),
+            rec_error: None,
+            about: false,
+            open_license: None,
             meter_in: Meter::default(),
             meter_out: Meter::default(),
             cpu_pct: 0.0,
@@ -468,19 +487,28 @@ impl MainWindow {
                         .flex()
                         .items_center()
                         .gap(SP_12)
-                        .child(div().flex_1().flex().flex_col().child("Post-filter").child(
-                            caption("Removes more leftover noise. Can sound a little thinner."),
-                        ))
                         .child(
-                            div().when(!loading, |d| d.cursor_pointer()).child(
-                                Switch::new("postfilter")
-                                    .checked(pf_on)
-                                    .disabled(loading)
-                                    .on_click(|on: &bool, _, cx| {
-                                        send(Command::SetPostFilter(*on), cx);
-                                        save_soon(cx);
-                                    }),
-                            ),
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child("Post-filter")
+                                .child(caption("Removes more noise. Can sound a little thinner.")),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .when(!loading, |d| d.cursor_pointer())
+                                .child(
+                                    Switch::new("postfilter")
+                                        .checked(pf_on)
+                                        .disabled(loading)
+                                        .on_click(|on: &bool, _, cx| {
+                                            send(Command::SetPostFilter(*on), cx);
+                                            save_soon(cx);
+                                        }),
+                                ),
                         ),
                 )
             })
@@ -594,7 +622,7 @@ impl MainWindow {
                 TEXT_SECONDARY
             }))
             .child(
-                div()
+                numeric(div())
                     .px(SP_4)
                     .rounded(RADIUS_CONTROL)
                     .when(enabled, |d| d.hover(|d| d.bg(c(ELEVATED))))
@@ -674,6 +702,7 @@ impl MainWindow {
         let head = div()
             .id(stage.id())
             .flex_1()
+            .min_w_0()
             .flex()
             .items_center()
             .gap(SP_8)
@@ -705,21 +734,357 @@ impl MainWindow {
             .flex()
             .flex_col()
             .py(SP_12)
+            .child(div().flex().items_center().gap(SP_12).child(head).child(
+                div().flex_none().cursor_pointer().child(
+                    Switch::new(stage.id()).checked(on).on_click(
+                        move |checked: &bool, window, cx| {
+                            // Read by the audio thread on its next frame; no lock.
+                            stage.flag(&params).store(*checked, Relaxed);
+                            save_soon(cx);
+                            window.refresh();
+                        },
+                    ),
+                ),
+            ))
+            .when(open, |d| d.child(self.stage_settings(stage, cx)))
+            .into_any_element()
+    }
+
+    /// Mute switch. Same action as the tray item and the shortcut.
+    fn mute_row(&self) -> AnyElement {
+        let muted = self.params.muted.load(Relaxed);
+        div()
+            .flex()
+            .items_center()
+            .gap(SP_12)
+            .py(SP_12)
             .child(
-                div().flex().items_center().gap(SP_12).child(head).child(
-                    div()
-                        .cursor_pointer()
-                        .child(Switch::new(stage.id()).checked(on).on_click(
-                            move |checked: &bool, window, cx| {
-                                // Read by the audio thread on its next frame; no lock.
-                                stage.flag(&params).store(*checked, Relaxed);
-                                save_soon(cx);
-                                window.refresh();
-                            },
-                        )),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child("Mute")
+                    .child(caption(if muted {
+                        "Nothing is sent to CABLE Input"
+                    } else {
+                        "Silences your voice everywhere at once"
+                    })),
+            )
+            .child(
+                div().flex_none().cursor_pointer().child(
+                    Switch::new("mute")
+                        .checked(muted)
+                        .on_click(|checked: &bool, _, cx| {
+                            let now = cx.global::<AppState>().audio.params.muted.load(Relaxed);
+                            if *checked != now {
+                                toggle_mute(cx);
+                            }
+                        }),
                 ),
             )
-            .when(open, |d| d.child(self.stage_settings(stage, cx)))
+            .into_any_element()
+    }
+
+    /// The global mute shortcut. Click the box, then press the new combination.
+    fn shortcut_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let st = cx.global::<AppState>();
+        let current = st
+            .hotkeys
+            .as_ref()
+            .and_then(|h| h.current())
+            .map(hotkey::label);
+        let hint: SharedString = if let Some(e) = self.rec_error.clone().or(st.hotkey_error.clone())
+        {
+            e.into()
+        } else if self.recording {
+            "Esc cancels · Backspace removes the shortcut".into()
+        } else {
+            "Works in games too".into()
+        };
+        let text: SharedString = if self.recording {
+            "Press keys…".into()
+        } else {
+            current.unwrap_or_else(|| "None".into()).into()
+        };
+        let rec = self.recording;
+        div()
+            .flex()
+            .items_center()
+            .gap(SP_12)
+            .py(SP_12)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child("Mute shortcut")
+                    .child(caption(hint)),
+            )
+            .child(
+                div()
+                    .id("shortcut")
+                    .track_focus(&self.rec_focus)
+                    .flex_none()
+                    .min_w(px(96.0))
+                    .flex()
+                    .justify_center()
+                    .px(SP_12)
+                    .py(SP_4)
+                    .rounded(RADIUS_CONTROL)
+                    .border_1()
+                    .border_color(c(if rec { ACCENT } else { BORDER }))
+                    .bg(c(if rec { ELEVATED } else { BG }))
+                    .text_size(px(LABEL))
+                    .text_color(c(if rec { TEXT_SECONDARY } else { TEXT_PRIMARY }))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(c(ELEVATED)))
+                    .child(text)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        if !this.recording {
+                            this.recording = true;
+                            this.rec_error = None;
+                            if let Some(h) = cx.global_mut::<AppState>().hotkeys.as_mut() {
+                                h.pause();
+                            }
+                            this.rec_focus.focus(window);
+                            cx.notify();
+                        }
+                    }))
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                        if this.recording {
+                            cx.stop_propagation();
+                            this.record_key(ev, cx);
+                        }
+                    }))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        if this.recording {
+                            this.stop_recording(cx);
+                        }
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn stop_recording(&mut self, cx: &mut Context<Self>) {
+        self.recording = false;
+        if let Some(h) = cx.global_mut::<AppState>().hotkeys.as_mut() {
+            h.resume();
+        }
+        cx.notify();
+    }
+
+    /// One key press while recording a shortcut.
+    fn record_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let k = &ev.keystroke;
+        let m = k.modifiers;
+        let any_mod = m.control || m.alt || m.shift || m.platform;
+        // Modifiers alone: wait for the actual key.
+        if matches!(
+            k.key.as_str(),
+            "control" | "ctrl" | "alt" | "shift" | "platform" | "win"
+        ) {
+            return;
+        }
+        let chosen: Option<String> = match k.key.as_str() {
+            "escape" if !any_mod => return self.stop_recording(cx),
+            "backspace" | "delete" if !any_mod => None,
+            key => match hotkey::from_press(m.control, m.alt, m.shift, m.platform, key) {
+                Ok(t) => Some(t),
+                Err(why) => {
+                    self.rec_error = Some(why.into());
+                    cx.notify();
+                    return;
+                }
+            },
+        };
+        let st = cx.global_mut::<AppState>();
+        let Some(h) = st.hotkeys.as_mut() else {
+            return self.stop_recording(cx);
+        };
+        match h.set(chosen.as_deref()) {
+            Ok(()) => {
+                st.hotkey_error = None;
+                st.settings.mute_hotkey = chosen.unwrap_or_default();
+                self.rec_error = None;
+                self.recording = false;
+                save_soon(cx);
+                cx.notify();
+            }
+            Err(e) => {
+                self.rec_error = Some(e);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The About page: what Sotto is, its version and license, and every third-party
+    /// license. Licenses open one at a time under their row.
+    fn about_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.open_license.as_ref().map(|(i, _)| *i);
+        let gpl = License {
+            name: "GNU General Public License v3.0 only",
+            used_by: "Sotto",
+            text: licenses::GPL,
+        };
+        let mut own: Vec<AnyElement> = std::iter::once(&gpl)
+            .chain(licenses::ALL.iter())
+            .enumerate()
+            .map(|(i, l)| self.license_row(i, l, open == Some(i), cx))
+            .collect();
+        let third = own.split_off(1);
+        column()
+            .child(
+                div()
+                    .id("back")
+                    .flex()
+                    .items_center()
+                    .gap(SP_4)
+                    .text_color(c(TEXT_SECONDARY))
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(c(TEXT_PRIMARY)))
+                    .child(
+                        svg()
+                            .path(assets::CHEVRON_LEFT)
+                            .size(px(16.0))
+                            .text_color(c(TEXT_SECONDARY)),
+                    )
+                    .child("Back")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.about = false;
+                        this.open_license = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(SP_12)
+                    .child(
+                        svg()
+                            .path(assets::MARK)
+                            .size(px(28.0))
+                            .flex_none()
+                            .text_color(c(ACCENT)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(HEADING))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Sotto"),
+                            )
+                            .child(caption(concat!("Version ", env!("CARGO_PKG_VERSION")))),
+                    ),
+            )
+            .child(
+                card("About")
+                    .child(
+                        "Sotto cleans your microphone in real time and sends it to VB-Cable. \
+                         It never touches your headphones, speakers or Windows sound settings.",
+                    )
+                    .child(caption(
+                        "Free software: you can use, study, share and change it under the \
+                         GNU General Public License v3.0. No telemetry; the only network use \
+                         is checking for updates.",
+                    ))
+                    .child(
+                        div()
+                            .id("repo")
+                            .text_color(c(ACCENT))
+                            .cursor_pointer()
+                            .hover(|d| d.text_color(c(ACCENT_HOVER)))
+                            .child("github.com/hamadsh2/Sotto")
+                            .on_click(|_: &ClickEvent, _, cx| cx.open_url(REPO_URL)),
+                    ),
+            )
+            .child(list_card(own))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(SP_4)
+                    .child(
+                        div()
+                            .text_size(px(LABEL))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(c(TEXT_SECONDARY))
+                            .child("Third-party licenses"),
+                    )
+                    .child(caption(
+                        "Sotto is built with these open-source projects. Thank you.",
+                    )),
+            )
+            .child(list_card(third))
+    }
+
+    /// One license: its name and who uses it; click to read it below.
+    fn license_row(&self, i: usize, l: &License, open: bool, cx: &mut Context<Self>) -> AnyElement {
+        let text = self
+            .open_license
+            .as_ref()
+            .filter(|_| open)
+            .map(|(_, t)| t.clone());
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id(("license", i))
+                    .flex()
+                    .items_center()
+                    .gap(SP_12)
+                    .py(SP_12)
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(l.name)
+                            .child(caption(l.used_by)),
+                    )
+                    .child(
+                        svg()
+                            .path(if open {
+                                assets::CHEVRON_DOWN
+                            } else {
+                                assets::CHEVRON_RIGHT
+                            })
+                            .size(px(16.0))
+                            .flex_none()
+                            .text_color(c(TEXT_SECONDARY)),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let was_open = this.open_license.as_ref().is_some_and(|(o, _)| *o == i);
+                        this.open_license = if was_open {
+                            None
+                        } else {
+                            let text = if i == 0 {
+                                licenses::GPL
+                            } else {
+                                licenses::ALL.get(i - 1).map_or("", |l| l.text)
+                            };
+                            Some((i, licenses::reflow(text).into()))
+                        };
+                        cx.notify();
+                    })),
+            )
+            .when_some(text, |d, text| {
+                d.child(
+                    div()
+                        .pb(SP_12)
+                        .text_size(px(CAPTION))
+                        .text_color(c(TEXT_SECONDARY))
+                        .child(text),
+                )
+            })
             .into_any_element()
     }
 
@@ -738,30 +1103,65 @@ impl MainWindow {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .child("Start with Windows")
                     .child(caption(hint)),
             )
+            .child(div().flex_none().cursor_pointer().child(
+                Switch::new("autostart").checked(on).on_click(cx.listener(
+                    |this, checked: &bool, _, cx| {
+                        match super::win::set_autostart(*checked) {
+                            Ok(()) => {
+                                this.autostart_error = None;
+                                let st = cx.global_mut::<AppState>();
+                                st.autostart = *checked;
+                                st.settings.start_with_windows = *checked;
+                                save_soon(cx);
+                            }
+                            Err(e) => this.autostart_error = Some(e),
+                        }
+                        cx.notify();
+                    },
+                )),
+            ))
+            .into_any_element()
+    }
+
+    /// "About Sotto": opens the About page.
+    fn about_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("open-about")
+            .flex()
+            .items_center()
+            .gap(SP_12)
+            .py(SP_12)
+            .cursor_pointer()
             .child(
                 div()
-                    .cursor_pointer()
-                    .child(Switch::new("autostart").checked(on).on_click(cx.listener(
-                        |this, checked: &bool, _, cx| {
-                            match super::win::set_autostart(*checked) {
-                                Ok(()) => {
-                                    this.autostart_error = None;
-                                    let st = cx.global_mut::<AppState>();
-                                    st.autostart = *checked;
-                                    st.settings.start_with_windows = *checked;
-                                    save_soon(cx);
-                                }
-                                Err(e) => this.autostart_error = Some(e),
-                            }
-                            cx.notify();
-                        },
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child("About Sotto")
+                    .child(caption(concat!(
+                        "Version ",
+                        env!("CARGO_PKG_VERSION"),
+                        " \u{00B7} licenses"
                     ))),
             )
+            .child(
+                svg()
+                    .path(assets::CHEVRON_RIGHT)
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(c(TEXT_SECONDARY)),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.about = true;
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -897,6 +1297,45 @@ fn segmented(
 }
 
 /// A panel on `surface` with a small label on top.
+const REPO_URL: &str = "https://github.com/hamadsh2/Sotto";
+
+/// The scrolling window background with the app font and text defaults. Each page has
+/// its own `id`, so each keeps its own scroll position.
+fn page(id: &'static str) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .size_full()
+        .overflow_y_scroll()
+        .bg(c(BG))
+        .font_family(FONT)
+        .text_color(c(TEXT_PRIMARY))
+        .text_size(px(BODY))
+}
+
+/// Tabular numerals for a value that changes while you watch (slider values, CPU,
+/// latency), so it doesn't jitter in width. Only there: Inter's tabular set also widens
+/// the hyphen and period, which looks odd in ordinary text.
+fn numeric<E: Styled>(mut e: E) -> E {
+    e.text_style()
+        .get_or_insert_with(Default::default)
+        .font_features = Some(tabular_numbers());
+    e
+}
+
+/// The content column. It sits inside the scroll area with its own height, so cards
+/// never get squeezed together when the window is short, and it stays a readable width
+/// when the window is wide.
+fn column() -> Div {
+    div()
+        .w_full()
+        .max_w(px(MAX_CONTENT_W))
+        .mx_auto()
+        .flex()
+        .flex_col()
+        .gap(SP_16)
+        .p(SP_24)
+}
+
 fn card(title: &'static str) -> Div {
     div()
         .flex()
@@ -940,8 +1379,21 @@ fn caption(text: impl Into<SharedString>) -> impl IntoElement {
 /// One level meter: `accent` body, `meter_peak` only in the top 10% and for the
 /// peak-hold tick, on an `elevated` track. `mark` is an optional thin `text_secondary`
 /// line (the gate threshold on the Mic meter).
-fn level_meter(label: &'static str, m: Meter, live: bool, mark: Option<f32>) -> impl IntoElement {
+/// `dim`: drawn in `text_secondary` (the Mic meter while muted: you can see you're
+/// talking, but nothing is sent).
+fn level_meter(
+    label: &'static str,
+    m: Meter,
+    live: bool,
+    mark: Option<f32>,
+    dim: bool,
+) -> impl IntoElement {
     const HOT: f32 = 0.9;
+    let (body, hot) = if dim {
+        (TEXT_SECONDARY, TEXT_SECONDARY)
+    } else {
+        (ACCENT, METER_PEAK)
+    };
     let (level, peak) = if live { (m.level, m.peak) } else { (0.0, 0.0) };
     div()
         .flex()
@@ -966,12 +1418,12 @@ fn level_meter(label: &'static str, m: Meter, live: bool, mark: Option<f32>) -> 
                     div()
                         .size_full()
                         .flex()
-                        .child(div().h_full().w(relative(level.min(HOT))).bg(c(ACCENT)))
+                        .child(div().h_full().w(relative(level.min(HOT))).bg(c(body)))
                         .child(
                             div()
                                 .h_full()
                                 .w(relative((level - HOT).max(0.0)))
-                                .bg(c(METER_PEAK)),
+                                .bg(c(hot)),
                         ),
                 )
                 .when_some(mark, |d, at| {
@@ -993,7 +1445,7 @@ fn level_meter(label: &'static str, m: Meter, live: bool, mark: Option<f32>) -> 
                             .h_full()
                             .w(px(2.0))
                             .left(relative((peak - 0.01).max(0.0)))
-                            .bg(c(METER_PEAK)),
+                            .bg(c(hot)),
                     )
                 }),
         )
@@ -1015,8 +1467,9 @@ fn warning_card(what: impl Into<SharedString>, fix: impl Into<SharedString>) -> 
 }
 
 /// Header: the Sotto mark, wordmark and tagline, and a small status pill.
-fn header(state: &State) -> impl IntoElement {
+fn header(state: &State, muted: bool) -> impl IntoElement {
     let (dot, text) = match state {
+        State::Running if muted => (TEXT_SECONDARY, "Muted"),
         State::Running => (ACCENT, "Running"),
         State::Starting => (TEXT_SECONDARY, "Starting…"),
         State::NeedsDevices => (TEXT_SECONDARY, "Choose a microphone"),
@@ -1065,9 +1518,13 @@ fn header(state: &State) -> impl IntoElement {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.about {
+            return page("about").child(self.about_page(cx));
+        }
         let st = self.status.lock().map(|s| s.clone()).unwrap_or_default();
         self.sync_pickers(&st, window, cx);
         let running = st.state == State::Running;
+        let muted = self.params.muted.load(Relaxed);
 
         let mut warnings: Vec<AnyElement> = Vec::new();
         if st.cable_missing {
@@ -1153,54 +1610,37 @@ impl Render for MainWindow {
                 .flex()
                 .gap(SP_4)
                 .child(label)
-                .child(div().text_color(c(TEXT_PRIMARY)).child(value))
+                .child(numeric(div()).text_color(c(TEXT_PRIMARY)).child(value))
         };
 
-        div()
-            .id("main")
-            .size_full()
-            .overflow_y_scroll()
-            .bg(c(BG))
-            .font_family(FONT)
-            .text_color(c(TEXT_PRIMARY))
-            .text_size(px(BODY))
-            .child(
-                // The content column. It sits inside the scroll area with its own height,
-                // so cards never get squeezed together when the window is short, and it
-                // stays a readable width when the window is wide.
-                div()
-                    .w_full()
-                    .max_w(px(MAX_CONTENT_W))
-                    .mx_auto()
-                    .flex()
-                    .flex_col()
-                    .gap(SP_16)
-                    .p(SP_24)
-                    .child(header(&st.state))
-                    .children(warnings)
-                    .child(self.engine_card(&st, cx))
-                    .child(
-                        card("Levels")
-                            .gap(SP_12)
-                            .child(level_meter("Mic", self.meter_in, running, gate_mark))
-                            .child(level_meter("Output", self.meter_out, running, None)),
-                    )
-                    .child(list_card(devices))
-                    .child(list_card(chain))
-                    .child(list_card(vec![self.startup_row(cx)]))
-                    .child(
-                        div()
-                            .flex()
-                            .gap(SP_8)
-                            .text_size(px(CAPTION))
-                            .text_color(c(TEXT_SECONDARY))
-                            .child(readout("CPU", format!("{:.2}%", self.cpu_pct)))
-                            .child("·")
-                            .child(readout("Latency", latency))
-                            .child("·")
-                            .child(readout("Memory", format!("{:.0} MB", self.private_mb))),
-                    ),
-            )
+        page("main").child(
+            column()
+                .child(header(&st.state, self.params.muted.load(Relaxed)))
+                .children(warnings)
+                .child(self.engine_card(&st, cx))
+                .child(
+                    card("Levels")
+                        .gap(SP_12)
+                        .child(level_meter("Mic", self.meter_in, running, gate_mark, muted))
+                        .child(level_meter("Output", self.meter_out, running, None, false)),
+                )
+                .child(list_card(devices))
+                .child(list_card(chain))
+                .child(list_card(vec![self.mute_row(), self.shortcut_row(cx)]))
+                .child(list_card(vec![self.startup_row(cx), self.about_row(cx)]))
+                .child(
+                    div()
+                        .flex()
+                        .gap(SP_8)
+                        .text_size(px(CAPTION))
+                        .text_color(c(TEXT_SECONDARY))
+                        .child(readout("CPU", format!("{:.2}%", self.cpu_pct)))
+                        .child("·")
+                        .child(readout("Latency", latency))
+                        .child("·")
+                        .child(readout("Memory", format!("{:.0} MB", self.private_mb))),
+                ),
+        )
     }
 }
 

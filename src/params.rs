@@ -14,6 +14,9 @@ pub struct Params {
     pub gate: AtomicBool,
     pub agc: AtomicBool,
     pub limiter: AtomicBool,
+    /// Mute: the output fades to silence (10 ms) while the streams keep running, so
+    /// unmuting is instant. Not saved: Sotto always starts unmuted.
+    pub muted: AtomicBool,
     /// Wet/dry mix of the denoise engine, 0.0..=1.0.
     strength: AtomicU32,
     /// The gate opens when the level rises above this (dBFS).
@@ -119,6 +122,7 @@ impl Params {
             gate: AtomicBool::new(true),
             agc: AtomicBool::new(true),
             limiter: AtomicBool::new(true),
+            muted: AtomicBool::new(false),
             strength: AtomicU32::new(1.0f32.to_bits()),
             gate_threshold_db: AtomicU32::new(GATE_DB_DEFAULT.to_bits()),
             agc_max_db: AtomicU32::new(AGC_MAX_DB_DEFAULT.to_bits()),

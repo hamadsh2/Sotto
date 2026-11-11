@@ -507,6 +507,8 @@ pub struct Chain {
     gate_amt: Ramp,
     agc_amt: Ramp,
     lim_amt: Ramp,
+    /// Output level for mute: 1 = live, 0 = muted.
+    live: Ramp,
     strength: Ramp,
     a: [f32; FRAME],
     b: [f32; FRAME],
@@ -540,6 +542,7 @@ impl Chain {
             // rather than jumping in loudness.
             agc_amt: Ramp::new(on(p.agc.load(Relaxed)), 300.0),
             lim_amt: Ramp::new(on(p.limiter.load(Relaxed)), 10.0),
+            live: Ramp::new(1.0 - on(p.muted.load(Relaxed)), 10.0),
             strength: Ramp::new(p.strength(), 50.0),
             a: [0.0; FRAME],
             b: [0.0; FRAME],
@@ -616,6 +619,7 @@ impl Chain {
         let gate_on = on(p.gate.load(Relaxed));
         let agc_on = on(p.agc.load(Relaxed));
         let lim_on = on(p.limiter.load(Relaxed));
+        let live = 1.0 - on(p.muted.load(Relaxed));
         let strength = p.strength();
         self.gate.set_threshold(p.gate_threshold_db());
 
@@ -690,13 +694,15 @@ impl Chain {
             *x *= 1.0 + (g - 1.0) * self.agc_amt.next(agc_on);
         }
 
-        // 5. Limiter (last), then a hard safety clamp to the valid range.
+        // 5. Limiter (last), then mute, then a hard safety clamp to the valid range.
+        // Mute is a 10 ms fade after everything else, so every stage keeps running
+        // (and stays settled) while muted and unmuting is instant and click-free.
         let mut min_gain = 1.0f32;
         for (y, x) in out.iter_mut().zip(&self.b) {
             let g = self.lim.process(*x);
             let g = 1.0 + (g - 1.0) * self.lim_amt.next(lim_on);
             min_gain = min_gain.min(g);
-            let v = x * g;
+            let v = x * g * self.live.next(live);
             *y = if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) };
         }
 
@@ -727,6 +733,31 @@ mod tests {
 
     fn rms(x: &[f32]) -> f32 {
         (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn mute_fades_to_silence_and_back_without_a_jump() {
+        let p = Params::new();
+        let mut chain = Chain::new(EngineSlot::new(Box::new(Off)), &p);
+        let x = sine(1000.0, 0.3, FRAME * 20);
+        let mut out = Vec::new();
+        for (i, f) in x.as_chunks::<FRAME>().0.iter().enumerate() {
+            p.muted.store((5..12).contains(&i), Relaxed);
+            let mut y = [0.0; FRAME];
+            chain.process(f, &p, &mut y);
+            out.extend_from_slice(&y);
+        }
+        // Fully silent once the 10 ms fade (one frame) has finished.
+        assert!(out[6 * FRAME..12 * FRAME].iter().all(|s| *s == 0.0));
+        // Sound again after unmuting.
+        assert!(rms(&out[14 * FRAME..]) > 0.05);
+        // No sample-to-sample jump larger than the sine itself can make (no click).
+        let max_step = out
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        let sine_step = 0.3 * 2.0 * std::f32::consts::PI * 1000.0 / SR as f32;
+        assert!(max_step <= sine_step * 1.6, "jump {max_step}");
     }
 
     #[test]

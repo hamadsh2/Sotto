@@ -1,0 +1,14 @@
+Third-party software in Sotto
+=============================
+
+Sotto is free software under the GNU General Public License v3.0 only.
+It is built with the open-source software below. The Inter font (SIL Open Font
+License 1.1) and Lucide icons (ISC) are listed in the app from assets/.
+Regenerate this file with:
+  cargo about generate about.hbs -o assets/THIRD_PARTY_LICENSES.txt
+{{#each licenses}}
+@@license {{{name}}}
+@@used-by {{#each used_by}}{{{crate.name}}} {{{crate.version}}}{{#unless @last}}, {{/unless}}{{/each}}
+
+{{{text}}}
+{{/each}}
