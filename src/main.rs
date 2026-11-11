@@ -9,6 +9,7 @@ mod devices;
 mod dfn;
 mod dsp;
 mod engine;
+mod eq;
 mod params;
 mod stats;
 
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 use crate::denoise::{Denoiser, Off, Rnnoise};
 use crate::devices::Dir;
 use crate::dsp::EngineSlot;
-use crate::params::Params;
+use crate::params::{EqPreset, Params};
 use crate::stats::Stats;
 
 const USAGE: &str = "\
@@ -54,6 +55,9 @@ Commands (type, then Enter):
   agc on|off         auto gain (steadies your level)
   agc max 12         most the auto gain may boost a quiet voice, in dB (0 … 24, default 12)
   postfilter on|off  DeepFilterNet only: stronger noise removal (voice may sound thinner)
+  eq on|off          tone EQ
+  eq natural         EQ preset: natural (flat, default) | warm | clear | broadcast
+  eq custom 2 -2 3   your own EQ in dB (each -6 … 6): body ~150 Hz, mud ~350 Hz, presence ~4 kHz
   limiter on|off     limiter (never louder than -1 dBFS)
   strength 0-100     denoise mix: 0 = original, 100 = fully cleaned
   status             show current settings
@@ -113,6 +117,25 @@ fn handle_command(line: &str, p: &Params) -> Cmd {
         ["agc", v] => toggle("agc", &p.agc, v),
         ["postfilter" | "pf", v @ ("on" | "off")] => return Cmd::PostFilter(*v == "on"),
         ["postfilter" | "pf", _] => println!("> use: postfilter on|off"),
+        ["eq", v @ ("on" | "off")] => toggle("eq", &p.eq, v),
+        ["eq", "custom", b, m, pr] => {
+            match (b.parse::<f32>(), m.parse::<f32>(), pr.parse::<f32>()) {
+                (Ok(b), Ok(m), Ok(pr)) => {
+                    p.set_eq_custom([b, m, pr]);
+                    println!("> eq {}", eq_text(p));
+                }
+                _ => println!("> use: eq custom <body> <mud> <presence>   e.g. eq custom 2 -2 3"),
+            }
+        }
+        ["eq", v] => match EqPreset::parse(v) {
+            Some(preset) => {
+                p.set_eq_preset(preset);
+                println!("> eq {}", eq_text(p));
+            }
+            None => {
+                println!("> use: eq on|off, eq natural|warm|clear|broadcast, or eq custom 2 -2 3")
+            }
+        },
         ["limiter" | "lim", v] => toggle("limiter", &p.limiter, v),
         ["strength", v] => match v.trim_end_matches('%').parse::<f32>() {
             Ok(pct) => {
@@ -130,13 +153,24 @@ fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
 
+/// e.g. "clear (body +0.0, mud -3.0, presence +3.0 dB)".
+fn eq_text(p: &Params) -> String {
+    let [b, m, pr] = p.eq_gains();
+    format!(
+        "{} (body {b:+.1}, mud {m:+.1}, presence {pr:+.1} dB)",
+        p.eq_preset().name()
+    )
+}
+
 fn print_status(p: &Params, engine: EngineKind) {
     let s = |b: &std::sync::atomic::AtomicBool| if b.load(Relaxed) { "on" } else { "off" };
     println!(
-        "> engine {} | hpf {} | strength {:.0}% | gate {} at {:.1} dBFS | agc {} (max +{:.1} dB) | limiter {} | postfilter {}",
+        "> engine {} | hpf {} | strength {:.0}% | eq {} {} | gate {} at {:.1} dBFS | agc {} (max +{:.1} dB) | limiter {} | postfilter {}",
         engine.name(),
         s(&p.hpf),
         p.strength() * 100.0,
+        s(&p.eq),
+        eq_text(p),
         s(&p.gate),
         p.gate_threshold_db(),
         s(&p.agc),

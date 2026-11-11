@@ -86,11 +86,15 @@ codegen-units = 1
   Use `Result` everywhere on device paths; no `unwrap()` there.
 
 ## Processing chain (exact order)
-`High-pass (~80 Hz) → Denoise engine → Noise gate → Auto gain + limiter → output`
+`High-pass (~80 Hz) → Denoise engine → EQ → Noise gate → Auto gain + limiter → output`
 - Every stage is independently toggleable.
+- EQ (added Phase 2c, user-approved): 3 bands — body (low shelf ~150 Hz), mud (peak
+  ~350 Hz), presence (peak ~4 kHz); presets Natural (flat, default) / Warm / Clear /
+  Broadcast at ±3 dB max, plus Custom (±6 dB per band, user-adjustable). After denoise
+  (the model sees the natural mic) and before AGC (which evens out preset loudness).
 - Noise gate has a threshold parameter and always comes after denoise.
 - Limiter is always last.
-- DSP stages (HPF, gate, AGC, limiter) must cost near-zero CPU (simple biquads /
+- DSP stages (HPF, EQ, gate, AGC, limiter) must cost near-zero CPU (simple biquads /
   envelope followers, no FFTs).
 
 ## Denoise engines

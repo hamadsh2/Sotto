@@ -7,7 +7,7 @@
 //! sees a half-written value. Rust has no `AtomicF32`, so floats travel as their raw
 //! bit pattern in an `AtomicU32`; `f32::to_bits` and `f32::from_bits` convert exactly.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed};
 
 pub struct Params {
     pub hpf: AtomicBool,
@@ -24,7 +24,64 @@ pub struct Params {
     /// when a DeepFilterNet engine is built, on the main thread; changing it rebuilds
     /// the engine through the normal crossfade.
     pub dfn_postfilter: AtomicBool,
+    pub eq: AtomicBool,
+    /// EQ band gains in dB: body, mud, presence (f32 bits).
+    eq_gains: [AtomicU32; 3],
+    /// Which preset those gains came from (`EqPreset as u8`), for display.
+    eq_preset: AtomicU8,
 }
+
+/// Named EQ settings. Mild on purpose (±3 dB max): they were not tuned per mic, and
+/// boosting presence too far would lift the hiss the denoiser left behind.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum EqPreset {
+    Natural = 0,
+    Warm = 1,
+    Clear = 2,
+    Broadcast = 3,
+    Custom = 4,
+}
+
+impl EqPreset {
+    pub const NAMED: [EqPreset; 4] = [Self::Natural, Self::Warm, Self::Clear, Self::Broadcast];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Natural => "natural",
+            Self::Warm => "warm",
+            Self::Clear => "clear",
+            Self::Broadcast => "broadcast",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::NAMED.into_iter().find(|p| p.name() == s)
+    }
+
+    /// Body (low shelf ~150 Hz), mud (peak ~350 Hz), presence (peak ~4 kHz), in dB.
+    pub fn gains(self) -> [f32; 3] {
+        match self {
+            Self::Natural | Self::Custom => [0.0, 0.0, 0.0],
+            Self::Warm => [2.5, -1.5, 0.0],
+            Self::Clear => [0.0, -3.0, 3.0],
+            Self::Broadcast => [2.0, -2.5, 2.5],
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Warm,
+            2 => Self::Clear,
+            3 => Self::Broadcast,
+            4 => Self::Custom,
+            _ => Self::Natural,
+        }
+    }
+}
+
+/// Custom EQ band range (dB).
+pub const EQ_DB_LIMIT: f32 = 6.0;
 
 pub const GATE_DB_MIN: f32 = -80.0;
 pub const GATE_DB_MAX: f32 = -10.0;
@@ -49,6 +106,9 @@ impl Params {
             gate_threshold_db: AtomicU32::new(GATE_DB_DEFAULT.to_bits()),
             agc_max_db: AtomicU32::new(AGC_MAX_DB_DEFAULT.to_bits()),
             dfn_postfilter: AtomicBool::new(false),
+            eq: AtomicBool::new(true),
+            eq_gains: [const { AtomicU32::new(0) }; 3], // 0u32 is 0.0f32: Natural
+            eq_preset: AtomicU8::new(EqPreset::Natural as u8),
         }
     }
 
@@ -90,6 +150,41 @@ impl Params {
         };
         self.agc_max_db.store(db.to_bits(), Relaxed);
     }
+
+    pub fn eq_gains(&self) -> [f32; 3] {
+        self.eq_gains
+            .each_ref()
+            .map(|g| f32::from_bits(g.load(Relaxed)))
+    }
+
+    pub fn eq_preset(&self) -> EqPreset {
+        EqPreset::from_u8(self.eq_preset.load(Relaxed))
+    }
+
+    pub fn set_eq_preset(&self, preset: EqPreset) {
+        self.store_eq(preset.gains());
+        self.eq_preset.store(preset as u8, Relaxed);
+    }
+
+    /// User-chosen band gains, each clamped to ±6 dB (NaN or infinity becomes 0).
+    pub fn set_eq_custom(&self, gains: [f32; 3]) {
+        self.store_eq(gains.map(|g| {
+            if g.is_finite() {
+                g.clamp(-EQ_DB_LIMIT, EQ_DB_LIMIT)
+            } else {
+                0.0
+            }
+        }));
+        self.eq_preset.store(EqPreset::Custom as u8, Relaxed);
+    }
+
+    // The three gains are separate atomics, so the worker may see a mix of old and new
+    // for one frame; it then simply fades on to the final values a frame later.
+    fn store_eq(&self, gains: [f32; 3]) {
+        for (a, g) in self.eq_gains.iter().zip(gains) {
+            a.store(g.to_bits(), Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +208,12 @@ mod tests {
         assert_eq!(p.agc_max_db(), AGC_MAX_DB_MAX);
         p.set_agc_max_db(f32::NAN);
         assert_eq!(p.agc_max_db(), AGC_MAX_DB_DEFAULT);
+        assert_eq!(p.eq_gains(), [0.0; 3]);
+        p.set_eq_preset(EqPreset::Clear);
+        assert_eq!(p.eq_gains(), [0.0, -3.0, 3.0]);
+        assert_eq!(p.eq_preset(), EqPreset::Clear);
+        p.set_eq_custom([9.0, f32::NAN, -2.0]);
+        assert_eq!(p.eq_gains(), [6.0, 0.0, -2.0]);
+        assert_eq!(p.eq_preset(), EqPreset::Custom);
     }
 }

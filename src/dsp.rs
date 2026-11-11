@@ -2,7 +2,7 @@
 //! The processing chain around the denoise engine, in this fixed order:
 //!
 //! ```text
-//! high-pass 80 Hz → denoise (wet/dry "strength") → noise gate → auto gain → limiter
+//! high-pass 80 Hz → denoise (wet/dry "strength") → EQ → noise gate → auto gain → limiter
 //! ```
 //!
 //! Every stage is a few multiplications per sample: a biquad filter or envelope
@@ -15,6 +15,7 @@
 //! `y = stage(x); x = x + (y - x) * amount`, with `amount` gliding toward 0 or 1.
 
 use crate::denoise::{Denoiser, FRAME};
+use crate::eq::Eq;
 use crate::params::Params;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -474,6 +475,7 @@ struct Switch {
 
 pub struct Chain {
     hpf: HighPass,
+    eq: Eq,
     gate: Gate,
     agc: Agc,
     lim: Limiter,
@@ -483,6 +485,8 @@ pub struct Chain {
     /// the main thread (dropping a model frees memory, which shouldn't happen here).
     retired: Option<EngineSlot>,
     hpf_amt: Ramp,
+    eq_amt: Ramp,
+    eq_dry: [f32; FRAME],
     gate_amt: Ramp,
     agc_amt: Ramp,
     lim_amt: Ramp,
@@ -504,6 +508,7 @@ impl Chain {
     pub fn new(engine: EngineSlot, p: &Params) -> Self {
         Self {
             hpf: HighPass::new(80.0),
+            eq: Eq::new(p.eq_gains()),
             gate: Gate::new(p.gate_threshold_db()),
             agc: Agc::new(),
             lim: Limiter::new(),
@@ -511,6 +516,8 @@ impl Chain {
             switch: None,
             retired: None,
             hpf_amt: Ramp::new(on(p.hpf.load(Relaxed)), 10.0),
+            eq_amt: Ramp::new(on(p.eq.load(Relaxed)), 10.0),
+            eq_dry: [0.0; FRAME],
             gate_amt: Ramp::new(on(p.gate.load(Relaxed)), 10.0),
             // Slower: the AGC may be up to +24 dB, so switching it fades over 300 ms
             // rather than jumping in loudness.
@@ -567,6 +574,7 @@ impl Chain {
     pub fn reset(&mut self) {
         self.hpf.z1 = 0.0;
         self.hpf.z2 = 0.0;
+        self.eq.reset();
         // A reconnect is a break in the audio anyway, so a switch in progress simply
         // completes now (the old engine goes to `retired`).
         if let Some(sw) = self.switch.take() {
@@ -587,6 +595,7 @@ impl Chain {
     ) -> FrameInfo {
         // Read every setting once per frame.
         let hpf_on = on(p.hpf.load(Relaxed));
+        let eq_on = on(p.eq.load(Relaxed));
         let gate_on = on(p.gate.load(Relaxed));
         let agc_on = on(p.agc.load(Relaxed));
         let lim_on = on(p.limiter.load(Relaxed));
@@ -637,6 +646,14 @@ impl Chain {
         if finished && let Some(sw) = self.switch.take() {
             let old = std::mem::replace(&mut self.engine, sw.next);
             self.retired = Some(old);
+        }
+
+        // 2c. EQ (always runs; faded in/out by `eq_amt` like the other stages; a preset
+        // change crossfades inside `Eq`).
+        self.eq_dry = self.b;
+        self.eq.process(&mut self.b, p.eq_gains());
+        for (y, x) in self.b.iter_mut().zip(&self.eq_dry) {
+            *y = x + (*y - x) * self.eq_amt.next(eq_on);
         }
 
         // 3. Gate (the detector always runs; the AGC uses it to tell speech from
