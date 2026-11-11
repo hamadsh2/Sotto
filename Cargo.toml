@@ -1,0 +1,22 @@
+[package]
+name = "sotto"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Just your voice. Lightweight real-time mic noise suppression for Windows."
+repository = "https://github.com/hamadsh2/Sotto"
+publish = false
+
+[dependencies]
+cpal = "0.18.2"
+ringbuf = "0.6.0"
+# default features pull in a CLI (clap, hound, ...) we don't need
+nnnoiseless = { version = "0.5.2", default-features = false }
+
+# Keep the default panic = "unwind": devices::no_panic relies on it to survive
+# cpal panicking when a device is unplugged mid-call. Do not set panic = "abort".
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
