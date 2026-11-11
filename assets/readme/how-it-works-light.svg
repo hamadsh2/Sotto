@@ -1,0 +1,29 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="124" viewBox="0 0 920 124" font-family="Inter, 'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title>Your mic goes into Sotto, which removes the noise and writes to CABLE Input; VB-Cable passes it to CABLE Output, which Discord, games and calls use as the microphone.</title>
+  <rect x="8" y="16" width="120" height="64" rx="12" fill="#FBF9F5" stroke="#E2DDD3" stroke-width="1"/>
+  <text x="68.0" y="44" text-anchor="middle" font-size="15" font-weight="600" fill="#2B2925">Your mic</text>
+  <text x="68.0" y="64" text-anchor="middle" font-size="12" fill="#6E695F">voice + noise</text>
+  <rect x="164" y="16" width="170" height="64" rx="12" fill="#FBF9F5" stroke="#6F8C7E" stroke-width="1.5"/>
+  <text x="249.0" y="44" text-anchor="middle" font-size="15" font-weight="600" fill="#2B2925">Sotto</text>
+  <text x="249.0" y="64" text-anchor="middle" font-size="12" fill="#6E695F">removes the noise</text>
+  <rect x="370" y="16" width="140" height="64" rx="12" fill="#FBF9F5" stroke="#E2DDD3" stroke-width="1"/>
+  <text x="440.0" y="44" text-anchor="middle" font-size="15" font-weight="600" fill="#2B2925">CABLE Input</text>
+  <text x="440.0" y="64" text-anchor="middle" font-size="12" fill="#6E695F">Sotto writes here</text>
+  <rect x="546" y="16" width="150" height="64" rx="12" fill="#FBF9F5" stroke="#E2DDD3" stroke-width="1"/>
+  <text x="621.0" y="44" text-anchor="middle" font-size="15" font-weight="600" fill="#2B2925">CABLE Output</text>
+  <text x="621.0" y="64" text-anchor="middle" font-size="12" fill="#6E695F">apps listen here</text>
+  <rect x="732" y="16" width="180" height="64" rx="12" fill="#FBF9F5" stroke="#E2DDD3" stroke-width="1"/>
+  <text x="822.0" y="44" text-anchor="middle" font-size="15" font-weight="600" fill="#2B2925">Discord, games, calls</text>
+  <text x="822.0" y="64" text-anchor="middle" font-size="12" fill="#6E695F">pick CABLE Output</text>
+  <path d="M134 48H158" stroke="#6E695F" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M152 43l6 5-6 5" fill="none" stroke="#6E695F" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M340 48H364" stroke="#6E695F" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M358 43l6 5-6 5" fill="none" stroke="#6E695F" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M516 48H540" stroke-dasharray="3 4" stroke="#6E695F" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M534 43l6 5-6 5" fill="none" stroke="#6E695F" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M702 48H726" stroke="#6E695F" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M720 43l6 5-6 5" fill="none" stroke="#6E695F" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M374 90v6H692v-6" fill="none" stroke="#E2DDD3" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="533.0" y="116" text-anchor="middle" font-size="12" fill="#6E695F">VB-Cable (free, from VB-Audio)</text>
+</svg>
