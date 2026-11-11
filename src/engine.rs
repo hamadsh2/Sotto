@@ -4,7 +4,8 @@
 //! ```text
 //!  mic ─(cpal capture thread)─► downmix to mono ─► raw ring ─┐
 //!                                                            ▼
-//!                               Sotto's denoise worker thread: 480-sample frame → denoise
+//!          Sotto's denoise worker thread: 480-sample frame → processing chain
+//!          (high-pass → denoise → gate → auto gain → limiter, see `dsp.rs`)
 //!                                                            │
 //!  CABLE Input ◄─(cpal render thread)─ pull samples ◄─ clean ring
 //! ```
@@ -36,6 +37,8 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 use crate::denoise::{Denoiser, FRAME};
+use crate::dsp::Chain;
+use crate::params::Params;
 use crate::stats::Stats;
 
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -78,7 +81,11 @@ unsafe extern "system" {
 const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
 
 impl Worker {
-    pub fn spawn(mut denoiser: Box<dyn Denoiser>, stats: Arc<Stats>) -> Result<Self, String> {
+    pub fn spawn(
+        mut denoiser: Box<dyn Denoiser>,
+        params: Arc<Params>,
+        stats: Arc<Stats>,
+    ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<WorkerMsg>();
         let thread = thread::Builder::new()
             .name("sotto-denoise".into())
@@ -90,13 +97,21 @@ impl Worker {
 
                 let mut frame = [0.0f32; FRAME];
                 let mut clean = [0.0f32; FRAME];
+                // All chain state is allocated here, once; processing never allocates.
+                let mut chain = Chain::new(&params);
                 // Warm-up: lets the engine build its per-thread tables now, not mid-stream.
-                denoiser.process(&frame, &mut clean);
+                chain.process(&frame, denoiser.as_mut(), &params, &mut clean);
 
                 let mut io: Option<(HeapCons<f32>, HeapProd<f32>)> = None;
                 loop {
                     match rx.try_recv() {
-                        Ok(WorkerMsg::Attach(raw, out)) => io = Some((raw, out)),
+                        Ok(WorkerMsg::Attach(raw, out)) => {
+                            // New streams: don't splice onto old audio. One silent
+                            // frame through the engine flushes its 10 ms overlap buffer.
+                            chain.reset();
+                            denoiser.process(&[0.0; FRAME], &mut clean);
+                            io = Some((raw, out));
+                        }
                         Ok(WorkerMsg::Quit) | Err(mpsc::TryRecvError::Disconnected) => return,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
@@ -104,8 +119,10 @@ impl Worker {
                         while raw.occupied_len() >= FRAME {
                             raw.pop_slice(&mut frame);
                             let t0 = Instant::now();
-                            denoiser.process(&frame, &mut clean);
+                            let info =
+                                chain.process(&frame, denoiser.as_mut(), &params, &mut clean);
                             stats.record_frame(t0.elapsed());
+                            stats.record_chain(&info);
                             // Drop a whole frame rather than splice half of one.
                             if out.vacant_len() >= FRAME {
                                 out.push_slice(&clean);

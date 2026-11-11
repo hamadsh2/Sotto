@@ -20,6 +20,12 @@ pub trait Denoiser: Send {
     ///
     /// Must be real-time safe: no allocation, no locks, no I/O.
     fn process(&mut self, input: &[f32; FRAME], output: &mut [f32; FRAME]);
+
+    /// How many samples the output lags the input. The chain delays the dry signal by
+    /// the same amount, so the strength (wet/dry) mix doesn't smear or comb-filter.
+    fn latency(&self) -> usize {
+        0
+    }
 }
 
 /// Passthrough — for before/after comparison.
@@ -46,6 +52,8 @@ pub struct Rnnoise {
 // nnnoiseless works on 480-sample frames too, so no frame-size adapter is needed.
 const _: () = assert!(nnnoiseless::FRAME_SIZE == FRAME);
 
+const RNNOISE_LATENCY: usize = FRAME;
+
 /// nnnoiseless expects 16-bit-range values (-32768..32767) stored in f32.
 const I16_SCALE: f32 = 32768.0;
 
@@ -62,6 +70,12 @@ impl Rnnoise {
 impl Denoiser for Rnnoise {
     fn name(&self) -> &'static str {
         "rnnoise"
+    }
+
+    /// RNNoise analyses overlapping 20 ms windows and outputs by overlap-add, so its
+    /// output trails its input by one frame (checked by `rnnoise_latency_is_one_frame`).
+    fn latency(&self) -> usize {
+        RNNOISE_LATENCY
     }
 
     fn process(&mut self, input: &[f32; FRAME], output: &mut [f32; FRAME]) {
@@ -91,6 +105,51 @@ mod tests {
         let mut out = [0.0; FRAME];
         Off.process(&input, &mut out);
         assert_eq!(input, out);
+    }
+
+    #[test]
+    fn rnnoise_latency_is_one_frame() {
+        // A tonal signal swelling at 3 Hz, which RNNoise keeps. The partials are
+        // deliberately inharmonic so the correlation has a single clear peak (a pure
+        // harmonic series would repeat every period). The lag with the highest
+        // cross-correlation between input and output is the engine's delay.
+        let n = FRAME * 300;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / 48_000.0;
+                let env = 0.5 + 0.5 * (2.0 * std::f32::consts::PI * 3.0 * t).sin();
+                let v: f32 = [173.0f32, 311.0, 523.0, 797.0, 1259.0, 2011.0]
+                    .iter()
+                    .map(|f| (2.0 * std::f32::consts::PI * f * t).sin())
+                    .sum();
+                0.05 * env * v
+            })
+            .collect();
+        let mut rn = Rnnoise::new();
+        let mut y = vec![0.0f32; n];
+        for (xi, yo) in x
+            .as_chunks::<FRAME>()
+            .0
+            .iter()
+            .zip(y.as_chunks_mut::<FRAME>().0)
+        {
+            let mut o = [0.0; FRAME];
+            rn.process(xi, &mut o);
+            yo.copy_from_slice(&o);
+        }
+        let start = FRAME * 100;
+        let best = (0..FRAME * 3)
+            .max_by(|&a, &b| {
+                let c = |lag: usize| -> f64 {
+                    (start..n - FRAME * 3)
+                        .map(|i| (x[i] * y[i + lag]) as f64)
+                        .sum()
+                };
+                c(a).total_cmp(&c(b))
+            })
+            .unwrap();
+        eprintln!("measured RNNoise latency: {best} samples");
+        assert_eq!(best, Rnnoise::new().latency());
     }
 
     #[test]

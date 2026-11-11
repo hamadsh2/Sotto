@@ -39,6 +39,12 @@ pub struct Stats {
     pub output_failed: AtomicBool,
     /// Set if the denoise worker thread died (e.g. the engine panicked).
     pub worker_failed: AtomicBool,
+    /// Frames in which the noise gate was open (main thread reads and resets).
+    pub gate_open_frames: AtomicU64,
+    /// Current auto-gain, dB, as f32 bits.
+    pub agc_gain_db: AtomicU32,
+    /// Largest limiter gain reduction since the last read, in hundredths of a dB.
+    pub limit_cdb: AtomicU32,
 }
 
 impl Stats {
@@ -58,6 +64,9 @@ impl Stats {
             input_failed: AtomicBool::new(false),
             output_failed: AtomicBool::new(false),
             worker_failed: AtomicBool::new(false),
+            gate_open_frames: AtomicU64::new(0),
+            agc_gain_db: AtomicU32::new(0),
+            limit_cdb: AtomicU32::new(0),
         }
     }
 
@@ -68,6 +77,16 @@ impl Stats {
         self.hist[idx].fetch_add(1, Relaxed);
         self.max_ns.fetch_max(ns, Relaxed);
         self.frames.fetch_add(1, Relaxed);
+    }
+
+    /// Worker: record the chain's readings for one frame. Atomics only.
+    pub fn record_chain(&self, info: &crate::dsp::FrameInfo) {
+        if info.gate_open {
+            self.gate_open_frames.fetch_add(1, Relaxed);
+        }
+        self.agc_gain_db.store(info.agc_gain_db.to_bits(), Relaxed);
+        let cdb = (info.limit_db.clamp(0.0, 100.0) * 100.0) as u32;
+        self.limit_cdb.fetch_max(cdb, Relaxed);
     }
 
     /// Render callback: record how many samples are queued right now. Atomics only.

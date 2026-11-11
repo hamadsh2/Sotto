@@ -6,7 +6,9 @@
 
 mod denoise;
 mod devices;
+mod dsp;
 mod engine;
+mod params;
 mod stats;
 
 use std::io::BufRead;
@@ -17,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::denoise::{Denoiser, Off, Rnnoise};
 use crate::devices::Dir;
+use crate::params::Params;
 use crate::stats::Stats;
 
 const USAGE: &str = "\
@@ -24,7 +27,7 @@ Sotto — just your voice.
 
 USAGE:
   sotto --list
-  sotto --input \"<mic name>\" [--output \"<VB-Cable name>\"] [--engine rnnoise|off] [--seconds N]
+  sotto --input \"<mic name>\" [--output \"<VB-Cable name>\"] [--engine rnnoise|off] [--seconds N] [--quiet]
 
 OPTIONS:
   --list            Show microphones and VB-Cable outputs, then exit
@@ -32,8 +35,82 @@ OPTIONS:
   --output NAME     VB-Cable output (default: \"CABLE Input\"). Only VB-Audio devices are allowed.
   --engine NAME     rnnoise (default, \"Light — for gaming\") or off (passthrough)
   --seconds N       Stop automatically after N seconds (for measurements)
+  --quiet           Don't print the once-a-second report (type \"stats\" to see it)
 
-Press Enter to stop.";
+While running, type a command and press Enter (\"help\" lists them, \"q\" stops).";
+
+const COMMANDS: &str = "\
+Commands (type, then Enter):
+  hpf on|off         high-pass filter (removes rumble below ~80 Hz)
+  gate on|off        noise gate (silence between words)
+  gate -45           gate threshold in dBFS (-80 … -10; lower = opens more easily)
+  agc on|off         auto gain (steadies your level)
+  limiter on|off     limiter (never louder than -1 dBFS)
+  strength 0-100     denoise mix: 0 = original, 100 = fully cleaned
+  status             show current settings
+  stats              show the latest performance line
+  report on|off      print that line every second (off = easier typing)
+  q                  stop";
+
+/// What the main loop should do after a typed command.
+enum Cmd {
+    Continue,
+    Quit,
+    ShowStats,
+    Report(bool),
+}
+
+/// Apply one typed command.
+fn handle_command(line: &str, p: &Params) -> Cmd {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let toggle = |name: &str, flag: &std::sync::atomic::AtomicBool, v: &str| match v {
+        "on" | "off" => {
+            flag.store(v == "on", Relaxed);
+            println!("> {name} {v}");
+        }
+        _ => println!("> use: {name} on|off"),
+    };
+    match words.as_slice() {
+        ["q" | "quit" | "exit"] => return Cmd::Quit,
+        ["stats"] => return Cmd::ShowStats,
+        ["report", v @ ("on" | "off")] => return Cmd::Report(*v == "on"),
+        [] | ["help" | "?"] => println!("{COMMANDS}"),
+        ["status"] => print_status(p),
+        ["hpf", v] => toggle("hpf", &p.hpf, v),
+        ["gate", v @ ("on" | "off")] => toggle("gate", &p.gate, v),
+        ["gate", v] => match v.parse::<f32>() {
+            Ok(db) => {
+                p.set_gate_threshold_db(db);
+                println!("> gate threshold {:.1} dBFS", p.gate_threshold_db());
+            }
+            Err(_) => println!("> use: gate on|off  or  gate -45"),
+        },
+        ["agc", v] => toggle("agc", &p.agc, v),
+        ["limiter" | "lim", v] => toggle("limiter", &p.limiter, v),
+        ["strength", v] => match v.trim_end_matches('%').parse::<f32>() {
+            Ok(pct) => {
+                p.set_strength(pct / 100.0);
+                println!("> strength {:.0}%", p.strength() * 100.0);
+            }
+            Err(_) => println!("> use: strength 0-100"),
+        },
+        _ => println!("> unknown command \"{line}\" — type help"),
+    }
+    Cmd::Continue
+}
+
+fn print_status(p: &Params) {
+    let s = |b: &std::sync::atomic::AtomicBool| if b.load(Relaxed) { "on" } else { "off" };
+    println!(
+        "> hpf {} | strength {:.0}% | gate {} at {:.1} dBFS | agc {} | limiter {}",
+        s(&p.hpf),
+        p.strength() * 100.0,
+        s(&p.gate),
+        p.gate_threshold_db(),
+        s(&p.agc),
+        s(&p.limiter),
+    );
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum EngineKind {
@@ -47,6 +124,7 @@ struct Args {
     output: Option<String>,
     engine: EngineKind,
     seconds: Option<u64>,
+    quiet: bool,
 }
 
 /// Minimal hand-written argument parser (no `clap` crate needed for five flags).
@@ -57,6 +135,7 @@ fn parse_args() -> Result<Args, String> {
         output: None,
         engine: EngineKind::Rnnoise,
         seconds: None,
+        quiet: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -75,6 +154,7 @@ fn parse_args() -> Result<Args, String> {
             "--seconds" => {
                 a.seconds = Some(value()?.parse().map_err(|_| "--seconds needs a number")?)
             }
+            "--quiet" => a.quiet = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option \"{other}\"")),
         }
@@ -138,24 +218,26 @@ fn run() -> Result<(), String> {
     let denoiser = make_denoiser(args.engine);
     println!("Engine: {} ({label})", denoiser.name());
 
-    // Enter on stdin stops the program. A separate thread blocks on reading the line
-    // and sends a message on the channel (like `queue.Queue` between Python threads).
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    // Typed commands. A separate thread blocks reading lines and sends each one on the
+    // channel (like `queue.Queue` between Python threads).
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
-        match std::io::stdin().lock().lines().next() {
-            Some(Ok(_)) => {
-                let _ = stop_tx.send(());
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if cmd_tx.send(line).is_err() {
+                return;
             }
-            // No console attached (stdin closed): keep `stop_tx` alive and never send,
-            // so only --seconds or Ctrl+C stops the program.
-            _ => loop {
-                std::thread::park();
-            },
+        }
+        // No console attached (stdin closed): keep `cmd_tx` alive and never send, so
+        // only --seconds or Ctrl+C stops the program.
+        loop {
+            std::thread::park();
         }
     });
 
     let stats = Arc::new(Stats::new());
-    let worker = engine::Worker::spawn(denoiser, Arc::clone(&stats))?;
+    let params = Arc::new(Params::new());
+    let worker = engine::Worker::spawn(denoiser, Arc::clone(&params), Arc::clone(&stats))?;
     let mut engine: Option<engine::Engine> = None;
     let started = Instant::now();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
@@ -164,8 +246,11 @@ fn run() -> Result<(), String> {
     let mut lost_reported = false;
     let mut drift = stats::DriftEstimator::default();
     let mut drift_start = Instant::now();
+    let mut report_every_second = !args.quiet;
+    let mut last_report = String::new();
 
-    println!("Running. Press Enter to stop.\n");
+    print_status(&params);
+    println!("Running. Type \"help\" for commands, \"q\" to stop.\n");
     loop {
         // (Re)start the streams if they aren't running. Only the two remembered endpoint
         // IDs are ever looked up; if either is missing we wait — no fallback device.
@@ -186,6 +271,8 @@ fn run() -> Result<(), String> {
                     // Drop numbers left over from before a disconnect.
                     let _ = stats.take_timing();
                     let _ = stats.take_buffer_avg();
+                    stats.gate_open_frames.store(0, Relaxed);
+                    stats.limit_cdb.store(0, Relaxed);
                     println!(
                         "Streams open: mic {}ch → 48 kHz mono → CABLE {}ch (shared mode)",
                         e.input_channels, e.output_channels
@@ -201,9 +288,34 @@ fn run() -> Result<(), String> {
             }
         }
 
-        match stop_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        // Handle typed commands for up to one second, then report.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut quit = false;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match cmd_rx.recv_timeout(left) {
+                Ok(line) => match handle_command(line.trim(), &params) {
+                    Cmd::Continue => {}
+                    Cmd::Quit => {
+                        quit = true;
+                        break;
+                    }
+                    Cmd::ShowStats if last_report.is_empty() => println!("> no data yet"),
+                    Cmd::ShowStats => println!("{last_report}"),
+                    Cmd::Report(on) => {
+                        report_every_second = on;
+                        println!("> report {}", if on { "on" } else { "off" });
+                    }
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    quit = true;
+                    break;
+                }
+            }
+        }
+        if quit {
+            break;
         }
         if args
             .seconds
@@ -246,13 +358,21 @@ fn run() -> Result<(), String> {
             let diff = stats.captured.load(Relaxed) as f64 - stats.rendered.load(Relaxed) as f64;
             drift.add(drift_start.elapsed().as_secs_f64(), diff);
             // Too few points → the slope is mostly jitter; wait 30 s before showing it.
+            let gate_pct = if t.frames > 0 {
+                stats.gate_open_frames.swap(0, Relaxed) as f64 / t.frames as f64 * 100.0
+            } else {
+                0.0
+            };
+            let agc_db = f32::from_bits(stats.agc_gain_db.load(Relaxed));
+            let limit_db = stats.limit_cdb.swap(0, Relaxed) as f32 / 100.0;
             let drift_txt = match drift.ppm(engine::SAMPLE_RATE as f64) {
                 Some((ppm, se)) if drift.points() >= 30 => format!("{ppm:+6.1} ±{se:.1} ppm"),
                 _ => "  (measuring)".into(),
             };
-            println!(
+            last_report = format!(
                 "frames {:>3} | proc p50 {:>5.3} ms  p99 {:>5.3} ms  max {:>6.3} ms | \
                  CPU {:>5.2}% | RAM {:>5.1} MB (private {:>5.1}) | buffer avg {:>4.1} ms | \
+                 gate open {gate_pct:>3.0}% | agc {agc_db:+5.1} dB | limit {limit_db:>4.1} dB | \
                  drift {drift_txt} | overflow {} underrun {} resync {}",
                 t.frames,
                 t.p50_ms,
@@ -266,6 +386,9 @@ fn run() -> Result<(), String> {
                 stats.underruns.load(Relaxed),
                 stats.resyncs.load(Relaxed),
             );
+            if report_every_second {
+                println!("{last_report}");
+            }
         }
     }
 
