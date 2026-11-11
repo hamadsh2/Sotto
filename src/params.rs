@@ -95,6 +95,12 @@ pub const AGC_MAX_DB_MAX: f32 = 24.0;
 /// the default. Mics differ, so this is a user setting (UI slider in Phase 3).
 pub const AGC_MAX_DB_DEFAULT: f32 = 12.0;
 
+impl Default for Params {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Params {
     pub fn new() -> Self {
         Self {

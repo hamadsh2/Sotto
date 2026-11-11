@@ -253,6 +253,12 @@ pub struct Agc {
     gain_lin: f32,
 }
 
+impl Default for Agc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Agc {
     pub fn new() -> Self {
         let t = db_to_lin(AGC_TARGET_DB);
@@ -328,6 +334,12 @@ pub const LIMIT_CEILING: f32 = 0.891_250_9; // −1 dBFS
 pub struct Limiter {
     env: f32,
     rel: f32,
+}
+
+impl Default for Limiter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Limiter {

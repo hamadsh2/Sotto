@@ -65,6 +65,12 @@ const RNNOISE_LATENCY: usize = FRAME;
 /// nnnoiseless expects 16-bit-range values (-32768..32767) stored in f32.
 const I16_SCALE: f32 = 32768.0;
 
+impl Default for Rnnoise {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Rnnoise {
     pub fn new() -> Self {
         Self {

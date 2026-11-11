@@ -112,9 +112,11 @@ codegen-units = 1
 - Compact single window: engine selector, strength slider, input/output level meters,
   device pickers (input mic + output VB-Cable), chain-stage toggles, live CPU/latency.
 - Global mute hotkey (`global-hotkey`), configurable, with a subtle on-screen state.
-- Closing the window hides to tray (`tray-icon`) without stopping audio. Recreate the
-  window only when opened from the tray.
-- No redraws while hidden; meters animate only while visible.
+- Closing the window hides it to the tray (`tray-icon`) without stopping audio; "Open"
+  in the tray shows it again. (Phase 3a, user-approved: GPUI quits when its last window
+  is destroyed and a hidden keep-alive window cost +40 MB, so the window is hidden,
+  not destroyed.)
+- No redraws while hidden (zero draws, zero GPU); meters animate only while visible.
 - "Start with Windows": optional, off by default.
 - Settings persisted as TOML in `%APPDATA%\Sotto`.
 
@@ -145,7 +147,8 @@ codegen-units = 1
 ## Performance targets
 | Metric | Target |
 |---|---|
-| "Light" mode (RNNoise) RAM | < ~15 MB |
+| Audio engine RAM, "Light" mode (measure with `sotto-cli`) | < ~15 MB private |
+| Whole app with the UI loaded (window shown or hidden) | < 150 MB private |
 | "Light" mode CPU | < 1% |
 | GPU while window hidden | 0% |
 | Per-frame processing time | well under 10 ms (report p50/p99/max) |
@@ -157,3 +160,6 @@ Measure and report actual numbers at the end of each phase (via `perf-auditor`).
 - Lint: `cargo clippy --all-targets -- -D warnings`
 - Format: `cargo fmt --all`
 - Test: `cargo test`
+- Binaries: `sotto` (window app, `src/main.rs` + `src/ui/`) and `sotto-cli` (typed
+  commands, for testing and measurements, `src/bin/sotto-cli.rs`); both drive the
+  engine through `src/control.rs` in the `sotto` library (`src/lib.rs`).

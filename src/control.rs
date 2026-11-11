@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//! Starts, watches and steers the audio engine: finds the two chosen devices, opens and
+//! re-opens their streams, switches denoise engines, and frees retired models.
+//!
+//! Shared by the command-line tool and the window app, so both behave identically. It
+//! runs on an ordinary thread, never on the audio path, so it may allocate and block
+//! briefly (e.g. while DeepFilterNet loads).
+//!
+//! Python analogy: `Controller` is a class whose methods you call from a loop
+//! (`tick()` once a second, `set_engine()` on a command). It collects human-readable
+//! messages in `notes` instead of printing, so the CLI can print them and the window can
+//! show them.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
+use std::time::Instant;
+
+use cpal::{DeviceId, Host};
+
+use crate::denoise::{Denoiser, Off, Rnnoise};
+use crate::devices::{self, Dir};
+use crate::dfn;
+use crate::dsp::EngineSlot;
+use crate::engine;
+use crate::params::Params;
+use crate::stats::{self, Stats};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EngineKind {
+    Rnnoise,
+    Dfn,
+    Off,
+}
+
+impl EngineKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rnnoise" | "light" => Some(Self::Rnnoise),
+            "dfn" | "deepfilternet" | "hq" => Some(Self::Dfn),
+            "off" | "none" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rnnoise => "rnnoise",
+            Self::Dfn => "deepfilternet",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rnnoise => "Light — for gaming",
+            Self::Dfn => "High quality — for recording & calls",
+            Self::Off => "Off",
+        }
+    }
+}
+
+/// Outcome of `set_engine` / `set_postfilter`, for the caller to report.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Change {
+    Started,
+    AlreadySo,
+    /// A switch is still finishing (they take ~0.1–0.2 s): try again shortly.
+    Busy,
+    /// Stored; it takes effect when DeepFilterNet is selected.
+    Stored,
+}
+
+pub struct Controller {
+    host: Host,
+    input_id: DeviceId,
+    input_name: String,
+    output_id: DeviceId,
+    output_name: String,
+    pub params: Arc<Params>,
+    pub stats: Arc<Stats>,
+    worker: Option<engine::Worker>,
+    streams: Option<engine::Engine>,
+    engine_kind: EngineKind,
+    switch_seq: u64,
+    lost_reported: bool,
+    /// Counts stream (re)openings, so callers can reset clock-drift tracking.
+    generation: u64,
+    notes: Vec<String>,
+}
+
+impl Controller {
+    /// Resolve the two devices by name, remember their exact Windows endpoint IDs, build
+    /// the first engine and start the denoise worker. Streams open on the first `tick`.
+    pub fn new(
+        input_query: &str,
+        output_query: Option<&str>,
+        kind: EngineKind,
+        params: Arc<Params>,
+    ) -> Result<Self, String> {
+        let host = cpal::default_host(); // WASAPI on Windows
+        let mic = devices::find_input(&host, input_query)?;
+        let cable = devices::find_output(&host, output_query)?;
+        let stats = Arc::new(Stats::new());
+        let mut notes = Vec::new();
+        let first = make_engine(kind, &params, &mut notes)?;
+        let worker = engine::Worker::spawn(first, Arc::clone(&params), Arc::clone(&stats))?;
+        Ok(Self {
+            host,
+            input_id: mic.id,
+            input_name: mic.name,
+            output_id: cable.id,
+            output_name: cable.name,
+            params,
+            stats,
+            worker: Some(worker),
+            streams: None,
+            engine_kind: kind,
+            switch_seq: 0,
+            lost_reported: false,
+            generation: 0,
+            notes,
+        })
+    }
+
+    pub fn input_name(&self) -> &str {
+        &self.input_name
+    }
+
+    pub fn output_name(&self) -> &str {
+        &self.output_name
+    }
+
+    /// The engine last asked for (the one heard is `stats.active_engine`).
+    pub fn engine_kind(&self) -> EngineKind {
+        self.engine_kind
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.streams.is_some()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// True if "CABLE Input" is Windows' default playback device (we only warn).
+    pub fn cable_is_default(&self) -> bool {
+        devices::default_playback_is_cable(&self.host)
+    }
+
+    /// Messages since the last call, oldest first.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// Call about once a second: notices a lost device, (re)opens the streams when both
+    /// devices are present, and frees retired engines. `Err` means the denoise worker
+    /// died, which is not recoverable.
+    pub fn tick(&mut self) -> Result<(), String> {
+        let Some(worker) = self.worker.as_ref() else {
+            return Err("the engine is stopped".into());
+        };
+        if self.stats.worker_failed.load(Relaxed) {
+            self.streams = None;
+            return Err("the denoise engine stopped unexpectedly".into());
+        }
+        drain_retired(worker, &mut self.notes);
+
+        // Only while streams run: the flags stay set until the device is back, and the
+        // loss is reported once.
+        let in_lost = self.stats.input_failed.load(Relaxed);
+        if self.streams.is_some() && (in_lost || self.stats.output_failed.load(Relaxed)) {
+            let which = if in_lost { "Microphone" } else { "VB-Cable" };
+            self.notes.push(format!(
+                "{which} disconnected — stopping streams and waiting for it to come back."
+            ));
+            self.streams = None; // drops (stops) both streams
+            self.lost_reported = true;
+        }
+
+        // (Re)open. Only the two remembered endpoint IDs are ever looked up; if either
+        // is missing we wait — never a fallback device.
+        if self.streams.is_none() {
+            let attempt =
+                devices::find_by_id(&self.host, Dir::Input, &self.input_id, &self.input_name)
+                    .and_then(|i| {
+                        let o = devices::find_by_id(
+                            &self.host,
+                            Dir::Output,
+                            &self.output_id,
+                            &self.output_name,
+                        )?;
+                        self.stats.input_failed.store(false, Relaxed);
+                        self.stats.output_failed.store(false, Relaxed);
+                        devices::no_panic("opening streams", || {
+                            engine::start(&i, &o, worker, Arc::clone(&self.stats))
+                        })
+                    });
+            match attempt {
+                Ok(e) => {
+                    // Drop numbers left over from before a disconnect.
+                    let _ = self.stats.take_timing();
+                    let _ = self.stats.take_buffer_avg();
+                    self.stats.gate_open_frames.store(0, Relaxed);
+                    self.stats.limit_cdb.store(0, Relaxed);
+                    self.notes.push(format!(
+                        "Streams open: mic {}ch → 48 kHz mono → CABLE {}ch (shared mode)",
+                        e.input_channels, e.output_channels
+                    ));
+                    self.streams = Some(e);
+                    self.generation += 1;
+                    self.lost_reported = false;
+                }
+                Err(e) if !self.lost_reported => {
+                    self.notes.push(format!("Waiting for devices: {e}"));
+                    self.lost_reported = true;
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Switch the denoise engine (crossfaded). DeepFilterNet loads here, which blocks
+    /// for ~0.5 s.
+    pub fn set_engine(&mut self, kind: EngineKind) -> Result<Change, String> {
+        if kind == self.engine_kind {
+            return Ok(Change::AlreadySo);
+        }
+        self.switch(kind, None)
+    }
+
+    /// Turn DeepFilterNet's post-filter on/off. The setting is stored only once applied,
+    /// so it always matches the running model.
+    pub fn set_postfilter(&mut self, on: bool) -> Result<Change, String> {
+        if on == self.params.dfn_postfilter.load(Relaxed) {
+            return Ok(Change::AlreadySo);
+        }
+        if self.engine_kind != EngineKind::Dfn {
+            self.params.dfn_postfilter.store(on, Relaxed);
+            return Ok(Change::Stored);
+        }
+        self.switch(EngineKind::Dfn, Some(on))
+    }
+
+    /// One switch at a time. So at most two models run at once: the old and the new
+    /// one, during the warm-up and 30 ms crossfade of a switch.
+    fn switch(&mut self, kind: EngineKind, postfilter: Option<bool>) -> Result<Change, String> {
+        let Some(worker) = self.worker.as_ref() else {
+            return Err("the engine is stopped".into());
+        };
+        if self.stats.switch_done.load(Relaxed) != self.switch_seq {
+            return Ok(Change::Busy);
+        }
+        let old_pf = postfilter.map(|on| self.params.dfn_postfilter.swap(on, Relaxed));
+        // Free a just-retired model before loading another one.
+        drain_retired(worker, &mut self.notes);
+        match make_engine(kind, &self.params, &mut self.notes) {
+            // Count the switch only once the worker has it, so a failed send can't leave
+            // every later switch stuck at `Busy`.
+            Ok(slot) => match worker.set_engine(slot, self.switch_seq + 1) {
+                Ok(()) => {
+                    self.switch_seq += 1;
+                    self.engine_kind = kind;
+                    Ok(Change::Started)
+                }
+                Err(e) => {
+                    if let Some(old) = old_pf {
+                        self.params.dfn_postfilter.store(old, Relaxed);
+                    }
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                if let Some(old) = old_pf {
+                    self.params.dfn_postfilter.store(old, Relaxed);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Stop streams first, then the worker they feed (same as dropping it).
+    pub fn stop(self) {}
+}
+
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.streams = None;
+        if let Some(w) = self.worker.take() {
+            w.stop();
+        }
+    }
+}
+
+/// Build an engine. DeepFilterNet is loaded only here, i.e. only when selected
+/// ("lazy loading").
+fn make_engine(
+    kind: EngineKind,
+    p: &Params,
+    notes: &mut Vec<String>,
+) -> Result<EngineSlot, String> {
+    let den: Box<dyn Denoiser> = match kind {
+        EngineKind::Rnnoise => Box::new(Rnnoise::new()),
+        EngineKind::Off => Box::new(Off),
+        EngineKind::Dfn => {
+            let t0 = Instant::now();
+            let d = dfn::DeepFilter::start(p.dfn_postfilter.load(Relaxed))?;
+            notes.push(format!(
+                "DeepFilterNet ready in {:.0} ms (adds {:.0} ms latency)",
+                t0.elapsed().as_secs_f64() * 1e3,
+                d.latency() as f64 / 48.0
+            ));
+            Box::new(d)
+        }
+    };
+    Ok(EngineSlot::new(den))
+}
+
+/// Drop engines the worker has finished with, here rather than on the audio path:
+/// dropping DeepFilterNet stops its thread and frees its model.
+fn drain_retired(worker: &engine::Worker, notes: &mut Vec<String>) {
+    while let Ok(old) = worker.retired.try_recv() {
+        let name = old.name();
+        drop(old);
+        if name == "deepfilternet" {
+            let (_, private) = stats::process_memory().unwrap_or((0, 0));
+            notes.push(format!(
+                "DeepFilterNet unloaded (private memory now {:.1} MB)",
+                private as f64 / 1_048_576.0
+            ));
+        }
+    }
+}

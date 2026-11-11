@@ -53,6 +53,12 @@ pub struct Stats {
     pub switch_done: AtomicU64,
 }
 
+impl Default for Stats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Stats {
     pub fn new() -> Self {
         Self {
