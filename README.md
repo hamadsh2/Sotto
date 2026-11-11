@@ -13,7 +13,7 @@ so Discord, games and calls hear only you. Small, CPU-only, quiet while you play
 
 <br>
 
-<img src="assets/readme/sotto-window.png" width="400" alt="The Sotto window: noise removal set to Light, strength 100%, level meters, the microphone and the VB-Cable output">
+<img src="assets/readme/sotto-window.png" width="400" alt="The Sotto window: noise removal set to Light, strength 100%, level meters showing a voice, the microphone and the VB-Cable output">
 
 </div>
 
