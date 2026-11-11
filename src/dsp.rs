@@ -234,11 +234,15 @@ impl Gate {
 
 /// Speech level the AGC aims for (RMS).
 const AGC_TARGET_DB: f32 = -20.0;
-const AGC_MAX_GAIN_DB: f32 = 12.0;
 const AGC_MIN_GAIN_DB: f32 = -12.0;
 /// Gain changes slowly so it never "pumps": +3 dB/s up, −12 dB/s down (per 10 ms frame).
 const AGC_UP_DB_PER_FRAME: f32 = 0.03;
 const AGC_DOWN_DB_PER_FRAME: f32 = 0.12;
+/// A word much louder than the gain expects (e.g. a shout after quiet speech at
+/// +18 dB) would otherwise lean on the limiter for ~1.5 s. When this frame alone is
+/// more than this far above target, the gain drops fast instead.
+const AGC_LOUD_MARGIN_DB: f32 = 6.0;
+const AGC_FAST_DOWN_DB_PER_FRAME: f32 = 1.0;
 
 pub struct Agc {
     /// Smoothed mean square of the voice (only while speaking), ~400 ms window.
@@ -265,12 +269,13 @@ impl Agc {
 
     /// Update the gain from one frame. `voiced[i]` says whether sample i is speech
     /// (the gate's decision); silence never moves the gain, so the AGC doesn't crank
-    /// up background noise. `gains` receives a per-sample gain that glides from the
+    /// up background noise. `max_db` caps the boost (user setting). `gains` receives a per-sample gain that glides from the
     /// previous frame's value to the new one, so changes are click-free.
     pub fn process(
         &mut self,
         buf: &[f32; FRAME],
         voiced: &[bool; FRAME],
+        max_db: f32,
         gains: &mut [f32; FRAME],
     ) {
         let (mut sum, mut n) = (0.0f32, 0u32);
@@ -288,9 +293,17 @@ impl Agc {
                 self.ms = t * t;
             }
             let level_db = 10.0 * self.ms.max(1e-12).log10();
-            let want = (AGC_TARGET_DB - level_db).clamp(AGC_MIN_GAIN_DB, AGC_MAX_GAIN_DB);
+            let want = (AGC_TARGET_DB - level_db).clamp(AGC_MIN_GAIN_DB, max_db.max(0.0));
             let d = want - self.gain_db;
             self.gain_db += d.clamp(-AGC_DOWN_DB_PER_FRAME, AGC_UP_DB_PER_FRAME);
+            // Only the part above target + margin is pulled down fast, so ordinary
+            // stressed syllables barely move it (no pumping).
+            let frame_db = 10.0 * frame_ms.max(1e-12).log10();
+            let excess = frame_db + self.gain_db - (AGC_TARGET_DB + AGC_LOUD_MARGIN_DB);
+            if excess > 0.0 {
+                self.gain_db -= excess.min(AGC_FAST_DOWN_DB_PER_FRAME);
+            }
+            self.gain_db = self.gain_db.max(AGC_MIN_GAIN_DB);
         }
         let start = self.gain_lin;
         let end = db_to_lin(self.gain_db);
@@ -400,6 +413,63 @@ pub struct FrameInfo {
     pub agc_gain_db: f32,
     /// Largest limiter gain reduction in this frame, dB (0 = not limiting).
     pub limit_db: f32,
+    /// Frames the current engine has failed to process so far (passed through).
+    pub engine_errors: u64,
+}
+
+/// A denoise engine plus the dry-path delay matched to its latency, so the strength
+/// (wet/dry) mix lines up. Built on the main thread (the delay buffer is allocated
+/// there) and then moved to the worker.
+pub struct EngineSlot {
+    den: Box<dyn Denoiser>,
+    dry: Delay,
+}
+
+impl EngineSlot {
+    pub fn new(den: Box<dyn Denoiser>) -> Self {
+        debug_assert!(den.latency() <= MAX_LATENCY);
+        let mut dry = Delay::new();
+        dry.set_len(den.latency());
+        Self { den, dry }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.den.name()
+    }
+
+    /// Denoise `a` and mix with the delayed dry signal, per-sample `strength`.
+    fn process(&mut self, a: &[f32; FRAME], strength: &[f32; FRAME], out: &mut [f32; FRAME]) {
+        self.den.process(a, out);
+        for ((wet, x), s) in out.iter_mut().zip(a).zip(strength) {
+            let dry = self.dry.process(*x);
+            let w = if wet.is_finite() { *wet } else { dry };
+            *wet = dry + (w - dry) * s;
+        }
+    }
+
+    /// Forget old audio: run enough silent frames to push everything the engine holds
+    /// (its latency) out the other end.
+    fn flush(&mut self, scratch: &mut [f32; FRAME]) {
+        for _ in 0..=self.den.latency() / FRAME {
+            self.den.process(&[0.0; FRAME], scratch);
+        }
+        self.dry.buf.fill(0.0);
+        self.dry.pos = 0;
+    }
+}
+
+/// Crossfade length when switching engines (spec: 20–50 ms).
+const SWITCH_FADE: usize = FRAME * 3; // 30 ms
+/// Before the crossfade the new engine runs silently on the live audio this long, on
+/// top of its own latency, so it has settled (noise estimate, lookahead filled) by the
+/// time it's heard. Otherwise its first frames would be silence or half-adapted.
+const SWITCH_WARMUP_FRAMES: u32 = 10; // 100 ms
+
+struct Switch {
+    next: EngineSlot,
+    warm_left: u32,
+    /// Samples into the crossfade.
+    pos: usize,
 }
 
 pub struct Chain {
@@ -407,7 +477,11 @@ pub struct Chain {
     gate: Gate,
     agc: Agc,
     lim: Limiter,
-    dry: Delay,
+    engine: EngineSlot,
+    switch: Option<Switch>,
+    /// The engine replaced by the last finished switch, waiting to be handed back to
+    /// the main thread (dropping a model frees memory, which shouldn't happen here).
+    retired: Option<EngineSlot>,
     hpf_amt: Ramp,
     gate_amt: Ramp,
     agc_amt: Ramp,
@@ -415,6 +489,8 @@ pub struct Chain {
     strength: Ramp,
     a: [f32; FRAME],
     b: [f32; FRAME],
+    next_out: [f32; FRAME],
+    strength_buf: [f32; FRAME],
     voiced: [bool; FRAME],
     gains: [f32; FRAME],
 }
@@ -425,25 +501,64 @@ fn on(b: bool) -> f32 {
 
 impl Chain {
     /// Starts with every stage at its current setting (no fade-in on startup).
-    pub fn new(p: &Params) -> Self {
+    pub fn new(engine: EngineSlot, p: &Params) -> Self {
         Self {
             hpf: HighPass::new(80.0),
             gate: Gate::new(p.gate_threshold_db()),
             agc: Agc::new(),
             lim: Limiter::new(),
-            dry: Delay::new(),
+            engine,
+            switch: None,
+            retired: None,
             hpf_amt: Ramp::new(on(p.hpf.load(Relaxed)), 10.0),
             gate_amt: Ramp::new(on(p.gate.load(Relaxed)), 10.0),
-            // Slower: the AGC may be up to ±12 dB, so switching it fades over 300 ms
+            // Slower: the AGC may be up to +24 dB, so switching it fades over 300 ms
             // rather than jumping in loudness.
             agc_amt: Ramp::new(on(p.agc.load(Relaxed)), 300.0),
             lim_amt: Ramp::new(on(p.limiter.load(Relaxed)), 10.0),
             strength: Ramp::new(p.strength(), 50.0),
             a: [0.0; FRAME],
             b: [0.0; FRAME],
+            next_out: [0.0; FRAME],
+            strength_buf: [0.0; FRAME],
             voiced: [false; FRAME],
             gains: [1.0; FRAME],
         }
+    }
+
+    /// Start a glitch-free switch to `next`: it warms up silently, then crossfades in
+    /// over 30 ms. If another switch was still in progress, its target is abandoned and
+    /// returned (for the caller to hand back to the main thread).
+    pub fn switch_to(&mut self, next: EngineSlot) -> Option<EngineSlot> {
+        let warm_left = (next.den.latency() / FRAME) as u32 + SWITCH_WARMUP_FRAMES;
+        self.switch
+            .replace(Switch {
+                next,
+                warm_left,
+                pos: 0,
+            })
+            .map(|s| s.next)
+    }
+
+    /// Switch immediately while no audio is flowing (nothing to crossfade). Returns the
+    /// replaced engine and any abandoned switch target.
+    pub fn replace_now(&mut self, next: EngineSlot) -> (EngineSlot, Option<EngineSlot>) {
+        let pending = self.switch.take().map(|s| s.next);
+        (std::mem::replace(&mut self.engine, next), pending)
+    }
+
+    /// Name of the engine currently heard.
+    pub fn engine_name(&self) -> &'static str {
+        self.engine.name()
+    }
+
+    pub fn is_switching(&self) -> bool {
+        self.switch.is_some()
+    }
+
+    /// The engine replaced by a finished switch, if any.
+    pub fn take_retired(&mut self) -> Option<EngineSlot> {
+        self.retired.take()
     }
 
     /// After a device reconnect: forget the audio from before the gap, so the first
@@ -452,17 +567,21 @@ impl Chain {
     pub fn reset(&mut self) {
         self.hpf.z1 = 0.0;
         self.hpf.z2 = 0.0;
-        self.dry.buf.fill(0.0);
-        self.dry.pos = 0;
+        // A reconnect is a break in the audio anyway, so a switch in progress simply
+        // completes now (the old engine goes to `retired`).
+        if let Some(sw) = self.switch.take() {
+            self.retired = Some(std::mem::replace(&mut self.engine, sw.next));
+        }
+        self.engine.flush(&mut self.next_out);
         self.gate.reset();
         self.lim.env = 0.0;
     }
 
-    /// Process one frame. Real-time safe: no allocation, no locks, no I/O.
+    /// Process one frame. No allocation, no locks, no I/O (the DeepFilterNet engine
+    /// waits a bounded time for its own thread; see `dfn.rs`).
     pub fn process(
         &mut self,
         input: &[f32; FRAME],
-        den: &mut dyn Denoiser,
         p: &Params,
         out: &mut [f32; FRAME],
     ) -> FrameInfo {
@@ -473,8 +592,6 @@ impl Chain {
         let lim_on = on(p.limiter.load(Relaxed));
         let strength = p.strength();
         self.gate.set_threshold(p.gate_threshold_db());
-        debug_assert!(den.latency() <= MAX_LATENCY);
-        self.dry.set_len(den.latency());
 
         // 0+1. Sanitize, then high-pass → self.a. A driver can hand us NaN, infinity or
         // wildly out-of-range values; one such sample would otherwise poison every
@@ -491,11 +608,35 @@ impl Chain {
         }
 
         // 2. Denoise → self.b, mixed with the (delay-matched) dry signal by strength.
-        den.process(&self.a, &mut self.b);
-        for (wet, x) in self.b.iter_mut().zip(&self.a) {
-            let dry = self.dry.process(*x);
-            let w = if wet.is_finite() { *wet } else { dry };
-            *wet = dry + (w - dry) * self.strength.next(strength);
+        for s in self.strength_buf.iter_mut() {
+            *s = self.strength.next(strength);
+        }
+        self.engine
+            .process(&self.a, &self.strength_buf, &mut self.b);
+
+        // 2b. Engine switch in progress: the new engine runs on the same input; after
+        // its warm-up, an equal-power crossfade (cos/sin) moves from old to new. Each
+        // engine is mixed with its own matched dry signal, so strength < 100% stays
+        // aligned on both sides.
+        let mut finished = false;
+        if let Some(sw) = self.switch.as_mut() {
+            sw.next
+                .process(&self.a, &self.strength_buf, &mut self.next_out);
+            if sw.warm_left > 0 {
+                sw.warm_left -= 1;
+            } else {
+                for (i, (o, n)) in self.b.iter_mut().zip(&self.next_out).enumerate() {
+                    let t = ((sw.pos + i + 1) as f32 / SWITCH_FADE as f32).min(1.0);
+                    let (g_new, g_old) = (t * std::f32::consts::FRAC_PI_2).sin_cos();
+                    *o = *o * g_old + n * g_new;
+                }
+                sw.pos += FRAME;
+                finished = sw.pos >= SWITCH_FADE;
+            }
+        }
+        if finished && let Some(sw) = self.switch.take() {
+            let old = std::mem::replace(&mut self.engine, sw.next);
+            self.retired = Some(old);
         }
 
         // 3. Gate (the detector always runs; the AGC uses it to tell speech from
@@ -509,7 +650,8 @@ impl Chain {
         }
 
         // 4. Auto gain.
-        self.agc.process(&self.b, &self.voiced, &mut self.gains);
+        self.agc
+            .process(&self.b, &self.voiced, p.agc_max_db(), &mut self.gains);
         for (x, g) in self.b.iter_mut().zip(&self.gains) {
             *x *= 1.0 + (g - 1.0) * self.agc_amt.next(agc_on);
         }
@@ -533,6 +675,7 @@ impl Chain {
                 0.0
             },
             limit_db: -lin_to_db(min_gain),
+            engine_errors: self.engine.den.errors(),
         }
     }
 }
@@ -581,25 +724,83 @@ mod tests {
         assert!(gain > 0.9, "gain after 10 ms: {gain}");
     }
 
+    /// On ordinary speech (syllables well above the average level), the fast descent
+    /// must not drag the level down: after settling, speech should sit near target.
     #[test]
-    fn agc_raises_quiet_voice_but_caps_at_12_db() {
+    fn agc_settles_near_target_on_speech() {
+        let n = FRAME * 3000; // 30 s
+        let mut v = crate::denoise::tests::voice_like_pub(n);
+        let rms = (v.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+        let scale = db_to_lin(-32.0) / rms;
+        v.iter_mut().for_each(|x| *x *= scale);
+        let mut agc = Agc::new();
+        let mut gains = [0.0; FRAME];
+        let (mut sum, mut cnt) = (0.0f64, 0usize);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for (k, f) in v.as_chunks::<FRAME>().0.iter().enumerate() {
+            agc.process(f, &[true; FRAME], 18.0, &mut gains);
+            if k >= 2000 {
+                for (x, g) in f.iter().zip(&gains) {
+                    sum += ((x * g) as f64).powi(2);
+                }
+                cnt += FRAME;
+                lo = lo.min(agc.gain_db());
+                hi = hi.max(agc.gain_db());
+            }
+        }
+        let out_db = 10.0 * (sum / cnt as f64).log10();
+        eprintln!("speech out {out_db:.1} dBFS (target {AGC_TARGET_DB}), gain {lo:.1}..{hi:.1} dB");
+        assert!(
+            (out_db - AGC_TARGET_DB as f64).abs() < 2.0,
+            "out {out_db:.1} dBFS"
+        );
+        assert!(hi - lo < 3.0, "gain wandered {lo:.1}..{hi:.1} dB");
+    }
+
+    #[test]
+    fn agc_drops_fast_when_a_loud_word_follows_quiet_speech() {
+        let mut agc = Agc::new();
+        let voiced = [true; FRAME];
+        let mut gains = [0.0; FRAME];
+        let quiet: [f32; FRAME] = sine(300.0, db_to_lin(-50.0), FRAME).try_into().unwrap();
+        for _ in 0..1000 {
+            agc.process(&quiet, &voiced, 18.0, &mut gains);
+        }
+        assert!(agc.gain_db() > 17.9);
+        // A loud word (RMS ≈ −9 dBFS): within 200 ms the gain is near or below 0 dB,
+        // instead of ~1.5 s at the normal −12 dB/s.
+        let loud: [f32; FRAME] = sine(300.0, 0.5, FRAME).try_into().unwrap();
+        for _ in 0..20 {
+            agc.process(&loud, &voiced, 18.0, &mut gains);
+        }
+        assert!(agc.gain_db() < 0.5, "gain after 200 ms: {}", agc.gain_db());
+    }
+
+    #[test]
+    fn agc_raises_quiet_voice_but_caps_at_the_user_max() {
         let mut agc = Agc::new();
         let voiced = [true; FRAME];
         let mut gains = [0.0; FRAME];
         let quiet: Vec<f32> = sine(300.0, db_to_lin(-50.0), FRAME);
         let frame: [f32; FRAME] = quiet.try_into().unwrap();
         for _ in 0..1000 {
-            agc.process(&frame, &voiced, &mut gains); // 10 s
+            agc.process(&frame, &voiced, 18.0, &mut gains); // 10 s
         }
-        assert!(
-            (agc.gain_db() - AGC_MAX_GAIN_DB).abs() < 1e-3,
-            "{}",
-            agc.gain_db()
-        );
+        assert!((agc.gain_db() - 18.0).abs() < 1e-3, "{}", agc.gain_db());
+        // Lowering the cap brings the gain down smoothly (−12 dB/s), never a jump.
+        let mut prev = gains[FRAME - 1];
+        for _ in 0..100 {
+            agc.process(&frame, &voiced, 12.0, &mut gains);
+            for g in gains {
+                assert!((g - prev).abs() < 1e-3, "gain jumped {prev} -> {g}");
+                prev = g;
+            }
+        }
+        assert!((agc.gain_db() - 12.0).abs() < 1e-3, "{}", agc.gain_db());
         // Silence (gate closed) doesn't move it.
         let before = agc.gain_db();
         for _ in 0..100 {
-            agc.process(&[0.0; FRAME], &[false; FRAME], &mut gains);
+            agc.process(&[0.0; FRAME], &[false; FRAME], 12.0, &mut gains);
         }
         assert_eq!(agc.gain_db(), before);
     }
@@ -625,10 +826,10 @@ mod tests {
         for b in [&p.hpf, &p.gate, &p.agc, &p.limiter] {
             b.store(false, Relaxed);
         }
-        let mut c = Chain::new(&p);
+        let mut c = Chain::new(EngineSlot::new(Box::new(Off)), &p);
         let x: [f32; FRAME] = sine(440.0, 0.5, FRAME).try_into().unwrap();
         let mut y = [0.0; FRAME];
-        c.process(&x, &mut Off, &p, &mut y);
+        c.process(&x, &p, &mut y);
         for (a, b) in x.iter().zip(&y) {
             assert!((a - b).abs() < 1e-6);
         }
@@ -640,7 +841,7 @@ mod tests {
         // stay close to the tone's own slope (no step = no click).
         let p = Params::new();
         p.set_gate_threshold_db(-80.0); // keep the gate open on the tone
-        let mut c = Chain::new(&p);
+        let mut c = Chain::new(EngineSlot::new(Box::new(Off)), &p);
         let tone = sine(200.0, 0.3, FRAME * 400);
         let max_slope = 0.3 * 2.0 * std::f32::consts::PI * 200.0 / SR as f32;
         let mut prev = 0.0f32;
@@ -653,7 +854,7 @@ mod tests {
             }
             let x = *chunk;
             let mut y = [0.0; FRAME];
-            c.process(&x, &mut Off, &p, &mut y);
+            c.process(&x, &p, &mut y);
             if k > 50 {
                 for s in y {
                     worst = worst.max((s - prev).abs());
@@ -663,7 +864,8 @@ mod tests {
                 prev = y[FRAME - 1];
             }
         }
-        // AGC gain up to +12 dB (×4) allowed on top of the tone's slope.
+        // The tone is loud (0.3), so the AGC applies little gain; its changes are
+        // ramped per sample. Allow ×4.5 on top of the tone's slope.
         assert!(
             worst < max_slope * 4.5,
             "worst step {worst}, tone slope {max_slope}"
@@ -674,25 +876,75 @@ mod tests {
     fn nan_and_inf_input_never_poison_the_chain() {
         let p = Params::new();
         p.set_gate_threshold_db(-80.0);
-        let mut c = Chain::new(&p);
-        let mut rn = crate::denoise::Rnnoise::new();
+        let mut c = Chain::new(
+            EngineSlot::new(Box::new(crate::denoise::Rnnoise::new())),
+            &p,
+        );
         let mut y = [0.0; FRAME];
         let mut bad = [0.0f32; FRAME];
         bad[0] = f32::NAN;
         bad[1] = f32::INFINITY;
         bad[2] = f32::NEG_INFINITY;
         bad[3] = 1e30;
-        c.process(&bad, &mut rn, &p, &mut y);
+        c.process(&bad, &p, &mut y);
         assert!(y.iter().all(|s| s.is_finite()));
         // A tone afterwards comes through, finite and audible.
         let tone = sine(440.0, 0.3, FRAME * 100);
         let mut last = 0.0;
         for chunk in tone.as_chunks::<FRAME>().0 {
-            c.process(chunk, &mut rn, &p, &mut y);
+            c.process(chunk, &p, &mut y);
             assert!(y.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
             last = rms(&y);
         }
         assert!(last > 0.01, "tone didn't recover: rms {last}");
+    }
+
+    #[test]
+    fn engine_switch_crossfades_without_a_jump_and_retires_old() {
+        // Switch Off → RNNoise → Off on a steady tone at 50% strength. The output must
+        // never step (no click), the switch must finish, and the old engine must come
+        // back via take_retired.
+        let p = Params::new();
+        for b in [&p.gate, &p.agc, &p.limiter] {
+            b.store(false, Relaxed);
+        }
+        p.set_strength(0.5);
+        let mut c = Chain::new(EngineSlot::new(Box::new(Off)), &p);
+        let tone = sine(200.0, 0.3, FRAME * 300);
+        let max_slope = 0.3 * 2.0 * std::f32::consts::PI * 200.0 / SR as f32;
+        let (mut prev, mut worst) = (0.0f32, 0.0f32);
+        let mut retired = Vec::new();
+        for (k, chunk) in tone.as_chunks::<FRAME>().0.iter().enumerate() {
+            match k {
+                50 => assert!(
+                    c.switch_to(EngineSlot::new(Box::new(crate::denoise::Rnnoise::new())))
+                        .is_none()
+                ),
+                150 => assert!(c.switch_to(EngineSlot::new(Box::new(Off))).is_none()),
+                _ => {}
+            }
+            let mut y = [0.0; FRAME];
+            c.process(chunk, &p, &mut y);
+            if let Some(old) = c.take_retired() {
+                retired.push((k, old.name()));
+            }
+            if k > 10 {
+                for s in y {
+                    worst = worst.max((s - prev).abs());
+                    prev = s;
+                }
+            } else {
+                prev = y[FRAME - 1];
+            }
+        }
+        // Off → rnnoise: 1 latency frame + 10 warm-up + 3 fade frames.
+        assert_eq!(retired, [(50 + 13, "off"), (150 + 12, "rnnoise")]);
+        assert_eq!(c.engine.name(), "off");
+        // RNNoise changes the tone's level/phase; allow a few times the tone's slope.
+        assert!(
+            worst < max_slope * 3.0,
+            "worst step {worst}, tone slope {max_slope}"
+        );
     }
 
     #[test]

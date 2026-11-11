@@ -7,7 +7,7 @@
 //! *atomic* integer, which the CPU updates indivisibly — no lock, so the audio thread
 //! can never be blocked waiting for the main thread.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 /// Histogram bucket width for per-frame processing time.
@@ -45,6 +45,12 @@ pub struct Stats {
     pub agc_gain_db: AtomicU32,
     /// Largest limiter gain reduction since the last read, in hundredths of a dB.
     pub limit_cdb: AtomicU32,
+    /// Frames the current engine failed to process (passed through instead).
+    pub engine_errors: AtomicU64,
+    /// Engine currently heard (`engine::engine_code`), published by the worker.
+    pub active_engine: AtomicU8,
+    /// Sequence number of the last engine switch the worker has completed.
+    pub switch_done: AtomicU64,
 }
 
 impl Stats {
@@ -67,6 +73,9 @@ impl Stats {
             gate_open_frames: AtomicU64::new(0),
             agc_gain_db: AtomicU32::new(0),
             limit_cdb: AtomicU32::new(0),
+            engine_errors: AtomicU64::new(0),
+            active_engine: AtomicU8::new(0),
+            switch_done: AtomicU64::new(0),
         }
     }
 
@@ -87,6 +96,7 @@ impl Stats {
         self.agc_gain_db.store(info.agc_gain_db.to_bits(), Relaxed);
         let cdb = (info.limit_db.clamp(0.0, 100.0) * 100.0) as u32;
         self.limit_cdb.fetch_max(cdb, Relaxed);
+        self.engine_errors.store(info.engine_errors, Relaxed);
     }
 
     /// Render callback: record how many samples are queued right now. Atomics only.

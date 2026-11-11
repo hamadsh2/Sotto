@@ -6,6 +6,7 @@
 
 mod denoise;
 mod devices;
+mod dfn;
 mod dsp;
 mod engine;
 mod params;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::denoise::{Denoiser, Off, Rnnoise};
 use crate::devices::Dir;
+use crate::dsp::EngineSlot;
 use crate::params::Params;
 use crate::stats::Stats;
 
@@ -27,13 +29,15 @@ Sotto — just your voice.
 
 USAGE:
   sotto --list
-  sotto --input \"<mic name>\" [--output \"<VB-Cable name>\"] [--engine rnnoise|off] [--seconds N] [--quiet]
+  sotto --input \"<mic name>\" [--output \"<VB-Cable name>\"] [--engine rnnoise|dfn|off] [--seconds N] [--quiet]
 
 OPTIONS:
   --list            Show microphones and VB-Cable outputs, then exit
   --input NAME      Microphone to clean (full name or a unique part of it)
   --output NAME     VB-Cable output (default: \"CABLE Input\"). Only VB-Audio devices are allowed.
-  --engine NAME     rnnoise (default, \"Light — for gaming\") or off (passthrough)
+  --engine NAME     rnnoise (default, \"Light — for gaming\"),
+                    dfn (DeepFilterNet, \"High quality — for recording & calls\"),
+                    or off (passthrough)
   --seconds N       Stop automatically after N seconds (for measurements)
   --quiet           Don't print the once-a-second report (type \"stats\" to see it)
 
@@ -41,10 +45,15 @@ While running, type a command and press Enter (\"help\" lists them, \"q\" stops)
 
 const COMMANDS: &str = "\
 Commands (type, then Enter):
+  engine rnnoise     Light — for gaming (default)
+  engine dfn         DeepFilterNet: High quality — for recording & calls
+  engine off         no denoising (for before/after comparison)
   hpf on|off         high-pass filter (removes rumble below ~80 Hz)
   gate on|off        noise gate (silence between words)
   gate -45           gate threshold in dBFS (-80 … -10; lower = opens more easily)
   agc on|off         auto gain (steadies your level)
+  agc max 12         most the auto gain may boost a quiet voice, in dB (0 … 24, default 12)
+  postfilter on|off  DeepFilterNet only: stronger noise removal (voice may sound thinner)
   limiter on|off     limiter (never louder than -1 dBFS)
   strength 0-100     denoise mix: 0 = original, 100 = fully cleaned
   status             show current settings
@@ -58,6 +67,11 @@ enum Cmd {
     Quit,
     ShowStats,
     Report(bool),
+    Engine(EngineKind),
+    /// Turn DeepFilterNet's post-filter on/off. Main stores the setting only once it
+    /// is applied, so the flag always matches the running model.
+    PostFilter(bool),
+    ShowStatus,
 }
 
 /// Apply one typed command.
@@ -74,8 +88,12 @@ fn handle_command(line: &str, p: &Params) -> Cmd {
         ["q" | "quit" | "exit"] => return Cmd::Quit,
         ["stats"] => return Cmd::ShowStats,
         ["report", v @ ("on" | "off")] => return Cmd::Report(*v == "on"),
+        ["engine", v] => match EngineKind::parse(v) {
+            Some(k) => return Cmd::Engine(k),
+            None => println!("> use: engine rnnoise|dfn|off"),
+        },
         [] | ["help" | "?"] => println!("{COMMANDS}"),
-        ["status"] => print_status(p),
+        ["status"] => return Cmd::ShowStatus,
         ["hpf", v] => toggle("hpf", &p.hpf, v),
         ["gate", v @ ("on" | "off")] => toggle("gate", &p.gate, v),
         ["gate", v] => match v.parse::<f32>() {
@@ -85,7 +103,16 @@ fn handle_command(line: &str, p: &Params) -> Cmd {
             }
             Err(_) => println!("> use: gate on|off  or  gate -45"),
         },
+        ["agc", "max", v] => match v.trim_end_matches("db").parse::<f32>() {
+            Ok(db) => {
+                p.set_agc_max_db(db);
+                println!("> agc max +{:.1} dB", p.agc_max_db());
+            }
+            Err(_) => println!("> use: agc max 12"),
+        },
         ["agc", v] => toggle("agc", &p.agc, v),
+        ["postfilter" | "pf", v @ ("on" | "off")] => return Cmd::PostFilter(*v == "on"),
+        ["postfilter" | "pf", _] => println!("> use: postfilter on|off"),
         ["limiter" | "lim", v] => toggle("limiter", &p.limiter, v),
         ["strength", v] => match v.trim_end_matches('%').parse::<f32>() {
             Ok(pct) => {
@@ -99,23 +126,58 @@ fn handle_command(line: &str, p: &Params) -> Cmd {
     Cmd::Continue
 }
 
-fn print_status(p: &Params) {
+fn on_off(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
+}
+
+fn print_status(p: &Params, engine: EngineKind) {
     let s = |b: &std::sync::atomic::AtomicBool| if b.load(Relaxed) { "on" } else { "off" };
     println!(
-        "> hpf {} | strength {:.0}% | gate {} at {:.1} dBFS | agc {} | limiter {}",
+        "> engine {} | hpf {} | strength {:.0}% | gate {} at {:.1} dBFS | agc {} (max +{:.1} dB) | limiter {} | postfilter {}",
+        engine.name(),
         s(&p.hpf),
         p.strength() * 100.0,
         s(&p.gate),
         p.gate_threshold_db(),
         s(&p.agc),
+        p.agc_max_db(),
         s(&p.limiter),
+        s(&p.dfn_postfilter),
     );
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum EngineKind {
     Rnnoise,
+    Dfn,
     Off,
+}
+
+impl EngineKind {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rnnoise" | "light" => Some(Self::Rnnoise),
+            "dfn" | "deepfilternet" | "hq" => Some(Self::Dfn),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rnnoise => "rnnoise",
+            Self::Dfn => "deepfilternet",
+            Self::Off => "off",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rnnoise => "Light — for gaming",
+            Self::Dfn => "High quality — for recording & calls",
+            Self::Off => "passthrough",
+        }
+    }
 }
 
 struct Args {
@@ -145,11 +207,9 @@ fn parse_args() -> Result<Args, String> {
             "--input" => a.input = Some(value()?),
             "--output" => a.output = Some(value()?),
             "--engine" => {
-                a.engine = match value()?.as_str() {
-                    "rnnoise" => EngineKind::Rnnoise,
-                    "off" => EngineKind::Off,
-                    other => return Err(format!("unknown engine \"{other}\"")),
-                }
+                let v = value()?;
+                a.engine = EngineKind::parse(&v)
+                    .ok_or_else(|| format!("unknown engine \"{v}\" (rnnoise, dfn, off)"))?;
             }
             "--seconds" => {
                 a.seconds = Some(value()?.parse().map_err(|_| "--seconds needs a number")?)
@@ -162,10 +222,41 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-fn make_denoiser(kind: EngineKind) -> Box<dyn Denoiser> {
-    match kind {
+/// Build an engine. DeepFilterNet is loaded only here, i.e. only when selected
+/// ("lazy loading"); it takes a moment, so say so.
+fn make_engine(kind: EngineKind, p: &Params) -> Result<EngineSlot, String> {
+    let den: Box<dyn Denoiser> = match kind {
         EngineKind::Rnnoise => Box::new(Rnnoise::new()),
         EngineKind::Off => Box::new(Off),
+        EngineKind::Dfn => {
+            println!("> loading DeepFilterNet…");
+            let t0 = Instant::now();
+            let d = dfn::DeepFilter::start(p.dfn_postfilter.load(Relaxed))?;
+            println!(
+                "> DeepFilterNet ready in {:.0} ms (adds {:.0} ms latency)",
+                t0.elapsed().as_secs_f64() * 1e3,
+                d.latency() as f64 / 48.0
+            );
+            Box::new(d)
+        }
+    };
+    Ok(EngineSlot::new(den))
+}
+
+/// Drop engines the worker has finished with. Doing it here, on the main thread,
+/// frees their memory (DeepFilterNet's model thread is stopped and its model released)
+/// without touching the audio path.
+fn drain_retired(worker: &engine::Worker) {
+    while let Ok(old) = worker.retired.try_recv() {
+        let name = old.name();
+        drop(old);
+        if name == "deepfilternet" {
+            let (_, private) = stats::process_memory().unwrap_or((0, 0));
+            println!(
+                "> DeepFilterNet unloaded (private memory now {:.1} MB)",
+                private as f64 / 1_048_576.0
+            );
+        }
     }
 }
 
@@ -211,12 +302,12 @@ fn run() -> Result<(), String> {
     let (output_id, output_name) = (cable.id, cable.name);
     println!("Input : {input_name}");
     println!("Output: {output_name}");
-    let label = match args.engine {
-        EngineKind::Rnnoise => "Light — for gaming",
-        EngineKind::Off => "passthrough",
-    };
-    let denoiser = make_denoiser(args.engine);
-    println!("Engine: {} ({label})", denoiser.name());
+    println!("Engine: {} ({})", args.engine.name(), args.engine.label());
+    let params = Arc::new(Params::new());
+    let first_engine = make_engine(args.engine, &params)?;
+    // The engine last asked for; `switch_seq` numbers the switch requests.
+    let mut engine_kind = args.engine;
+    let mut switch_seq: u64 = 0;
 
     // Typed commands. A separate thread blocks reading lines and sends each one on the
     // channel (like `queue.Queue` between Python threads).
@@ -236,8 +327,7 @@ fn run() -> Result<(), String> {
     });
 
     let stats = Arc::new(Stats::new());
-    let params = Arc::new(Params::new());
-    let worker = engine::Worker::spawn(denoiser, Arc::clone(&params), Arc::clone(&stats))?;
+    let worker = engine::Worker::spawn(first_engine, Arc::clone(&params), Arc::clone(&stats))?;
     let mut engine: Option<engine::Engine> = None;
     let started = Instant::now();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
@@ -249,7 +339,7 @@ fn run() -> Result<(), String> {
     let mut report_every_second = !args.quiet;
     let mut last_report = String::new();
 
-    print_status(&params);
+    print_status(&params, engine_kind);
     println!("Running. Type \"help\" for commands, \"q\" to stop.\n");
     loop {
         // (Re)start the streams if they aren't running. Only the two remembered endpoint
@@ -302,6 +392,60 @@ fn run() -> Result<(), String> {
                     }
                     Cmd::ShowStats if last_report.is_empty() => println!("> no data yet"),
                     Cmd::ShowStats => println!("{last_report}"),
+                    Cmd::ShowStatus => print_status(&params, engine_kind),
+                    Cmd::PostFilter(on) if on == params.dfn_postfilter.load(Relaxed) => {
+                        println!("> postfilter already {}", on_off(on))
+                    }
+                    Cmd::PostFilter(on) if engine_kind != EngineKind::Dfn => {
+                        params.dfn_postfilter.store(on, Relaxed);
+                        println!(
+                            "> postfilter {} (applies when you select engine dfn)",
+                            on_off(on)
+                        )
+                    }
+                    // One switch at a time (they take ~0.1–0.2 s). So at most two models
+                    // run at once: the old and the new one, during the warm-up and 30 ms
+                    // crossfade of a switch.
+                    Cmd::Engine(_) | Cmd::PostFilter(_)
+                        if stats.switch_done.load(Relaxed) != switch_seq =>
+                    {
+                        println!("> still switching — try again in a moment")
+                    }
+                    Cmd::Engine(k) if k == engine_kind => {
+                        println!("> already using {}", k.name())
+                    }
+                    // Changing the post-filter rebuilds DeepFilterNet and crossfades to
+                    // it, exactly like an engine switch (no click).
+                    c @ (Cmd::Engine(_) | Cmd::PostFilter(_)) => {
+                        let (k, pf) = match c {
+                            Cmd::Engine(k) => (k, None),
+                            Cmd::PostFilter(on) => (EngineKind::Dfn, Some(on)),
+                            _ => (engine_kind, None),
+                        };
+                        // The new model is built with the new setting; restored on failure.
+                        let old_pf = pf.map(|on| params.dfn_postfilter.swap(on, Relaxed));
+                        // Free a just-retired model before loading another one.
+                        drain_retired(&worker);
+                        match make_engine(k, &params) {
+                            Ok(slot) => {
+                                switch_seq += 1;
+                                worker.set_engine(slot, switch_seq)?;
+                                engine_kind = k;
+                                match pf {
+                                    Some(on) => println!("> postfilter {}", on_off(on)),
+                                    None => {
+                                        println!("> switching to {} ({})", k.name(), k.label())
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(old) = old_pf {
+                                    params.dfn_postfilter.store(old, Relaxed);
+                                }
+                                println!("> could not switch: {e}")
+                            }
+                        }
+                    }
                     Cmd::Report(on) => {
                         report_every_second = on;
                         println!("> report {}", if on { "on" } else { "off" });
@@ -317,6 +461,7 @@ fn run() -> Result<(), String> {
         if quit {
             break;
         }
+        drain_retired(&worker);
         if args
             .seconds
             .is_some_and(|s| started.elapsed() >= Duration::from_secs(s))
@@ -370,10 +515,17 @@ fn run() -> Result<(), String> {
                 _ => "  (measuring)".into(),
             };
             last_report = format!(
-                "frames {:>3} | proc p50 {:>5.3} ms  p99 {:>5.3} ms  max {:>6.3} ms | \
+                "{:<7} | frames {:>3} | proc p50 {:>5.3} ms  p99 {:>5.3} ms  max {:>6.3} ms | \
                  CPU {:>5.2}% | RAM {:>5.1} MB (private {:>5.1}) | buffer avg {:>4.1} ms | \
                  gate open {gate_pct:>3.0}% | agc {agc_db:+5.1} dB | limit {limit_db:>4.1} dB | \
-                 drift {drift_txt} | overflow {} underrun {} resync {}",
+                 drift {drift_txt} | overflow {} underrun {} resync {} | engine errors {}",
+                // The engine actually heard right now (published by the worker).
+                match stats.active_engine.load(Relaxed) {
+                    1 => "rnnoise",
+                    2 => "dfn",
+                    3 => "off",
+                    _ => "?",
+                },
                 t.frames,
                 t.p50_ms,
                 t.p99_ms,
@@ -385,6 +537,7 @@ fn run() -> Result<(), String> {
                 stats.overflows.load(Relaxed),
                 stats.underruns.load(Relaxed),
                 stats.resyncs.load(Relaxed),
+                stats.engine_errors.load(Relaxed),
             );
             if report_every_second {
                 println!("{last_report}");

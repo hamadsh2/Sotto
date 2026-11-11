@@ -12,6 +12,13 @@ cpal = "0.18.2"
 ringbuf = "0.6.0"
 # default features pull in a CLI (clap, hound, ...) we don't need
 nnnoiseless = { version = "0.5.2", default-features = false }
+# DeepFilterNet (MIT/Apache-2.0, code and model weights). The model-running version
+# isn't on crates.io (latest there is 0.2.5 without inference), so it's pinned to an
+# exact commit. "tract" = ONNX inference; "default-model" embeds DeepFilterNet3
+# (~8 MB). Default features are off: they add audio file decoders we don't use.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "7b14b895fe7fc42cab72b4a4c1e49c982bd6404b", default-features = false, features = ["tract", "default-model"] }
+# Must match the ndarray version deep_filter uses (its audio arrays are this type).
+ndarray = "0.15.6"
 
 # Keep the default panic = "unwind": devices::no_panic relies on it to survive
 # cpal panicking when a device is unplugged mid-call. Do not set panic = "abort".

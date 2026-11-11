@@ -36,12 +36,22 @@ use cpal::{Device, ErrorKind, SampleFormat, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
-use crate::denoise::{Denoiser, FRAME};
-use crate::dsp::Chain;
+use crate::denoise::FRAME;
+use crate::dsp::{Chain, EngineSlot};
 use crate::params::Params;
 use crate::stats::Stats;
 
 pub const SAMPLE_RATE: u32 = 48_000;
+
+/// Small number for each engine, so the worker can publish the active one atomically.
+pub fn engine_code(name: &str) -> u8 {
+    match name {
+        "rnnoise" => 1,
+        "deepfilternet" => 2,
+        "off" => 3,
+        _ => 0,
+    }
+}
 
 /// Capacity of each ring buffer: 200 ms. A hard ceiling; normal operation stays near TARGET.
 const RING_CAPACITY: usize = SAMPLE_RATE as usize / 5;
@@ -62,6 +72,8 @@ const MAX_SAMPLES: usize = FRAME * 6; // 60 ms
 enum WorkerMsg {
     /// New ring halves for a freshly opened pair of streams.
     Attach(HeapCons<f32>, HeapProd<f32>),
+    /// Switch to this engine (crossfaded while audio flows).
+    SetEngine(EngineSlot, u64),
     Quit,
 }
 
@@ -69,6 +81,9 @@ enum WorkerMsg {
 pub struct Worker {
     tx: mpsc::Sender<WorkerMsg>,
     thread: JoinHandle<()>,
+    /// Engines the worker no longer uses come back here, so they are dropped (and a
+    /// model's memory freed) on the main thread, not on the audio path.
+    pub retired: mpsc::Receiver<EngineSlot>,
 }
 
 #[link(name = "kernel32")]
@@ -82,11 +97,12 @@ const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
 
 impl Worker {
     pub fn spawn(
-        mut denoiser: Box<dyn Denoiser>,
+        engine: EngineSlot,
         params: Arc<Params>,
         stats: Arc<Stats>,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<WorkerMsg>();
+        let (ret_tx, retired) = mpsc::channel::<EngineSlot>();
         let thread = thread::Builder::new()
             .name("sotto-denoise".into())
             .spawn(move || {
@@ -98,19 +114,47 @@ impl Worker {
                 let mut frame = [0.0f32; FRAME];
                 let mut clean = [0.0f32; FRAME];
                 // All chain state is allocated here, once; processing never allocates.
-                let mut chain = Chain::new(&params);
+                let mut chain = Chain::new(engine, &params);
                 // Warm-up: lets the engine build its per-thread tables now, not mid-stream.
-                chain.process(&frame, denoiser.as_mut(), &params, &mut clean);
+                chain.process(&frame, &params, &mut clean);
 
                 let mut io: Option<(HeapCons<f32>, HeapProd<f32>)> = None;
+                // When the last frame was processed, to know whether audio is flowing.
+                let mut last_frame: Option<Instant> = None;
+                let mut last_seq: u64 = 0;
+                // Sending hands ownership to the main thread (like putting an object on
+                // a queue.Queue); `let _` ignores a closed channel at shutdown.
+                let give_back = |slot: EngineSlot| {
+                    let _ = ret_tx.send(slot);
+                };
                 loop {
                     match rx.try_recv() {
                         Ok(WorkerMsg::Attach(raw, out)) => {
-                            // New streams: don't splice onto old audio. One silent
-                            // frame through the engine flushes its 10 ms overlap buffer.
+                            // New streams: don't splice onto old audio.
                             chain.reset();
-                            denoiser.process(&[0.0; FRAME], &mut clean);
+                            if let Some(old) = chain.take_retired() {
+                                give_back(old);
+                            }
                             io = Some((raw, out));
+                        }
+                        Ok(WorkerMsg::SetEngine(slot, seq)) => {
+                            last_seq = seq;
+                            let flowing = last_frame
+                                .is_some_and(|t| t.elapsed() < Duration::from_millis(200));
+                            if flowing {
+                                // Warm up, then crossfade (see Chain::switch_to).
+                                if let Some(abandoned) = chain.switch_to(slot) {
+                                    give_back(abandoned);
+                                }
+                            } else {
+                                // No audio to crossfade: swap right away.
+                                let (old, abandoned) = chain.replace_now(slot);
+                                give_back(old);
+                                if let Some(a) = abandoned {
+                                    give_back(a);
+                                }
+                            }
+                            continue; // check for more messages before sleeping
                         }
                         Ok(WorkerMsg::Quit) | Err(mpsc::TryRecvError::Disconnected) => return,
                         Err(mpsc::TryRecvError::Empty) => {}
@@ -119,10 +163,13 @@ impl Worker {
                         while raw.occupied_len() >= FRAME {
                             raw.pop_slice(&mut frame);
                             let t0 = Instant::now();
-                            let info =
-                                chain.process(&frame, denoiser.as_mut(), &params, &mut clean);
+                            let info = chain.process(&frame, &params, &mut clean);
                             stats.record_frame(t0.elapsed());
                             stats.record_chain(&info);
+                            last_frame = Some(t0);
+                            if let Some(old) = chain.take_retired() {
+                                give_back(old);
+                            }
                             // Drop a whole frame rather than splice half of one.
                             if out.vacant_len() >= FRAME {
                                 out.push_slice(&clean);
@@ -131,13 +178,35 @@ impl Worker {
                             }
                         }
                     }
+                    // Tell the main thread which engine is heard, and when the last
+                    // requested switch has finished (so it can accept another).
+                    stats
+                        .active_engine
+                        .store(engine_code(chain.engine_name()), Relaxed);
+                    if !chain.is_switching() {
+                        stats.switch_done.store(last_seq, Relaxed);
+                    }
                     // Sleep until the capture callback wakes us (or 20 ms, to notice
                     // messages when no audio is flowing).
                     thread::park_timeout(Duration::from_millis(20));
                 }
             })
             .map_err(|e| format!("could not start denoise thread: {e}"))?;
-        Ok(Self { tx, thread })
+        Ok(Self {
+            tx,
+            thread,
+            retired,
+        })
+    }
+
+    /// Ask the worker to switch engines. `seq` is echoed in `Stats::switch_done` once
+    /// the switch has finished. The old engine comes back on `retired`.
+    pub fn set_engine(&self, slot: EngineSlot, seq: u64) -> Result<(), String> {
+        self.tx
+            .send(WorkerMsg::SetEngine(slot, seq))
+            .map_err(|_| "denoise thread is not running".to_string())?;
+        self.thread.thread().unpark();
+        Ok(())
     }
 
     pub fn stop(self) {

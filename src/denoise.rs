@@ -18,12 +18,20 @@ pub trait Denoiser: Send {
 
     /// Process exactly one frame. Samples are f32 in [-1.0, 1.0].
     ///
-    /// Must be real-time safe: no allocation, no locks, no I/O.
+    /// Runs on Sotto's denoise worker thread, never inside a sound-card callback. It
+    /// must not lock or do I/O, and must return well within the 10 ms frame.
+    /// DeepFilterNet hands the frame to its own thread and waits a bounded time for the
+    /// answer (see `dfn.rs`).
     fn process(&mut self, input: &[f32; FRAME], output: &mut [f32; FRAME]);
 
     /// How many samples the output lags the input. The chain delays the dry signal by
     /// the same amount, so the strength (wet/dry) mix doesn't smear or comb-filter.
     fn latency(&self) -> usize {
+        0
+    }
+
+    /// Frames this engine failed to process (it passed the input through instead).
+    fn errors(&self) -> u64 {
         0
     }
 }
@@ -93,7 +101,7 @@ impl Denoiser for Rnnoise {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -107,25 +115,49 @@ mod tests {
         assert_eq!(input, out);
     }
 
-    #[test]
-    fn rnnoise_latency_is_one_frame() {
-        // A tonal signal swelling at 3 Hz, which RNNoise keeps. The partials are
-        // deliberately inharmonic so the correlation has a single clear peak (a pure
-        // harmonic series would repeat every period). The lag with the highest
-        // cross-correlation between input and output is the engine's delay.
-        let n = FRAME * 300;
-        let x: Vec<f32> = (0..n)
+    /// A synthetic voice: a glottal-like harmonic series whose pitch glides between
+    /// ~100 and ~180 Hz (so it never repeats exactly and the correlation has one clear
+    /// peak), shaped by two vowel formants and chopped into 4 Hz "syllables". Steady
+    /// tones won't do: DeepFilterNet rightly treats them as noise and removes them.
+    pub(crate) fn voice_like_pub(n: usize) -> Vec<f32> {
+        voice_like(n)
+    }
+
+    fn voice_like(n: usize) -> Vec<f32> {
+        use std::f32::consts::PI;
+        let mut phase = 0.0f32;
+        (0..n)
             .map(|i| {
                 let t = i as f32 / 48_000.0;
-                let env = 0.5 + 0.5 * (2.0 * std::f32::consts::PI * 3.0 * t).sin();
-                let v: f32 = [173.0f32, 311.0, 523.0, 797.0, 1259.0, 2011.0]
-                    .iter()
-                    .map(|f| (2.0 * std::f32::consts::PI * f * t).sin())
-                    .sum();
-                0.05 * env * v
+                let f0 =
+                    140.0 + 40.0 * (2.0 * PI * 0.7 * t).sin() + 8.0 * (2.0 * PI * 5.0 * t).sin();
+                phase += 2.0 * PI * f0 / 48_000.0;
+                if phase > 2.0 * PI {
+                    phase -= 2.0 * PI;
+                }
+                let mut v = 0.0;
+                for h in 1..=30 {
+                    let fh = f0 * h as f32;
+                    if fh > 8000.0 {
+                        break;
+                    }
+                    // two formants (~700 Hz and ~1200 Hz), like an "ah"
+                    let formant = 1.0 / (1.0 + ((fh - 700.0) / 150.0).powi(2))
+                        + 0.6 / (1.0 + ((fh - 1200.0) / 200.0).powi(2))
+                        + 0.05;
+                    v += formant * (phase * h as f32).sin() / h as f32;
+                }
+                let syl = (2.0 * PI * 4.0 * t).sin().max(0.0);
+                0.15 * syl * v
             })
-            .collect();
-        let mut rn = Rnnoise::new();
+            .collect()
+    }
+
+    /// Measures an engine's delay: the lag with the highest cross-correlation between
+    /// input and output.
+    fn measure_latency(den: &mut dyn Denoiser) -> usize {
+        let n = FRAME * 300;
+        let x = voice_like(n);
         let mut y = vec![0.0f32; n];
         for (xi, yo) in x
             .as_chunks::<FRAME>()
@@ -133,23 +165,77 @@ mod tests {
             .iter()
             .zip(y.as_chunks_mut::<FRAME>().0)
         {
-            let mut o = [0.0; FRAME];
-            rn.process(xi, &mut o);
-            yo.copy_from_slice(&o);
+            den.process(xi, yo);
         }
-        let start = FRAME * 100;
-        let best = (0..FRAME * 3)
-            .max_by(|&a, &b| {
-                let c = |lag: usize| -> f64 {
-                    (start..n - FRAME * 3)
-                        .map(|i| (x[i] * y[i + lag]) as f64)
-                        .sum()
-                };
-                c(a).total_cmp(&c(b))
-            })
-            .unwrap();
+        let (start, max_lag) = (FRAME * 100, FRAME * 6);
+        let energy = |v: &[f32]| v[start..].iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
+        eprintln!(
+            "{}: kept {:.1} dB of the voice",
+            den.name(),
+            10.0 * (energy(&y) / energy(&x)).log10()
+        );
+        let corr = |lag: usize| -> f64 {
+            (start..n - max_lag)
+                .map(|i| (x[i] * y[i + lag]) as f64)
+                .sum()
+        };
+        (0..max_lag)
+            .max_by(|&a, &b| corr(a).total_cmp(&corr(b)))
+            .unwrap()
+    }
+
+    #[test]
+    fn rnnoise_latency_is_one_frame() {
+        let mut rn = Rnnoise::new();
+        let best = measure_latency(&mut rn);
         eprintln!("measured RNNoise latency: {best} samples");
-        assert_eq!(best, Rnnoise::new().latency());
+        assert_eq!(best, rn.latency());
+    }
+
+    #[test]
+    fn deepfilter_latency_matches_measurement() {
+        let mut df = crate::dfn::DeepFilter::start(false).unwrap();
+        let best = measure_latency(&mut df);
+        eprintln!("measured DeepFilterNet latency: {best} samples");
+        assert_eq!(best, df.latency());
+        assert_eq!(df.errors(), 0);
+    }
+
+    #[test]
+    fn deepfilter_attenuates_noise_and_reports_speed() {
+        let mut seed: u32 = 12345;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) as f32 / (1 << 24) as f32 - 0.5) * 0.05
+        };
+        let t0 = std::time::Instant::now();
+        let mut df = crate::dfn::DeepFilter::start(false).unwrap();
+        eprintln!(
+            "DeepFilterNet load: {:.0} ms",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        let (mut e_in, mut e_out) = (0.0f64, 0.0f64);
+        let mut times = Vec::new();
+        for frame_idx in 0..300 {
+            let mut input = [0.0; FRAME];
+            input.iter_mut().for_each(|s| *s = noise());
+            let mut out = [0.0; FRAME];
+            let t = std::time::Instant::now();
+            df.process(&input, &mut out);
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+            if frame_idx >= 100 {
+                e_in += input.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
+                e_out += out.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "DeepFilterNet per frame (this test build): p50 {:.3} ms, p99 {:.3} ms, max {:.3} ms",
+            times[150], times[296], times[299]
+        );
+        let reduction_db = 10.0 * (e_in / e_out.max(1e-12)).log10();
+        eprintln!("DeepFilterNet reduction {reduction_db:.1} dB");
+        assert!(reduction_db > 6.0, "only {reduction_db:.1} dB reduction");
     }
 
     #[test]
@@ -178,5 +264,73 @@ mod tests {
         let reduction_db = 10.0 * (e_in / e_out.max(1e-12)).log10();
         eprintln!("reduction {reduction_db:.1} dB");
         assert!(reduction_db > 6.0, "only {reduction_db:.1} dB reduction");
+    }
+}
+
+#[cfg(test)]
+mod dfn_speech_probe {
+    use super::*;
+
+    #[test]
+    #[ignore] // diagnostic: cargo test --release dfn_speech -- --ignored --nocapture
+    fn dfn_speech_timing() {
+        let x = super::tests::voice_like_pub(FRAME * 500);
+        let mut df = crate::dfn::DeepFilter::start(false).unwrap();
+        let mut times = Vec::new();
+        let mut y = [0.0f32; FRAME];
+        for xi in x.as_chunks::<FRAME>().0 {
+            let t = std::time::Instant::now();
+            df.process(xi, &mut y);
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+            std::thread::sleep(std::time::Duration::from_millis(10).saturating_sub(t.elapsed()));
+        }
+        times.sort_by(f64::total_cmp);
+        let n = times.len();
+        eprintln!(
+            "DFN on voice: p50 {:.3} p90 {:.3} p99 {:.3} max {:.3} ms, errors {} of {n}",
+            times[n / 2],
+            times[n * 9 / 10],
+            times[n * 99 / 100],
+            times[n - 1],
+            df.errors()
+        );
+    }
+}
+
+#[cfg(test)]
+mod dfn_stage_probe {
+    use super::*;
+
+    /// DeepFilterNet must not flip between processing modes on a steady voice: with
+    /// the library defaults it flipped on ~24% of frames (heard as a "layered",
+    /// unstable voice). Sotto's settings (`dfn::runtime_params`) must keep it steady.
+    #[test]
+    fn dfn_stage_flips() {
+        use df::tract::{DfParams, DfTract};
+        let n = FRAME * 1000;
+        let voice = super::tests::voice_like_pub(n);
+        let mut seed: u32 = 7;
+        for noise_db in [-60.0f32, -45.0] {
+            let amp = 10f32.powf(noise_db / 20.0) * 3.4;
+            let mut m =
+                DfTract::new(DfParams::default(), &crate::dfn::runtime_params(false)).unwrap();
+            let mut x = ndarray::Array2::<f32>::zeros((1, FRAME));
+            let mut y = ndarray::Array2::<f32>::zeros((1, FRAME));
+            let (mut flips, mut prev) = (0, (false, false, false));
+            for (k, chunk) in voice.as_chunks::<FRAME>().0.iter().enumerate() {
+                for (d, s) in x.iter_mut().zip(chunk) {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *d = s + ((seed >> 8) as f32 / (1 << 24) as f32 - 0.5) * amp;
+                }
+                let lsnr = m.process(x.view(), y.view_mut()).unwrap();
+                let st = m.apply_stages(lsnr);
+                if k > 0 && st != prev {
+                    flips += 1;
+                }
+                prev = st;
+            }
+            eprintln!("noise {noise_db} dBFS: {flips} mode flips in 1000 frames");
+            assert!(flips <= 10, "{flips} mode flips at {noise_db} dBFS noise");
+        }
     }
 }
