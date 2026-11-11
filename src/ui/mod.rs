@@ -9,8 +9,10 @@
 //!   refresh skips its redraw, so nothing is drawn and the GPU stays idle.
 //! - Only "Quit Sotto" in the tray ends the program.
 
+mod assets;
 mod audio;
 mod main_window;
+mod meter;
 mod theme;
 mod tray;
 mod win;
@@ -65,21 +67,24 @@ fn parse_args() -> Choice {
 
 pub fn run() {
     let choice = parse_args();
-    Application::new().run(move |cx: &mut App| {
-        gpui_component::init(cx);
-        theme::apply(cx);
+    Application::new()
+        .with_assets(assets::Assets)
+        .run(move |cx: &mut App| {
+            gpui_component::init(cx);
+            theme::apply(cx);
 
-        let audio = Audio::spawn(choice);
-        let tray = tray::build(cx, on_tray).ok();
-        cx.set_global(AppState {
-            audio,
-            main: None,
-            main_id: None,
-            visible: Arc::new(AtomicBool::new(true)),
-            tray,
+            let visible = Arc::new(AtomicBool::new(true));
+            let audio = Audio::spawn(choice, Arc::clone(&visible));
+            let tray = tray::build(cx, on_tray).ok();
+            cx.set_global(AppState {
+                audio,
+                main: None,
+                main_id: None,
+                visible,
+                tray,
+            });
+            open_main(cx);
         });
-        open_main(cx);
-    });
 }
 
 fn on_tray(action: tray::Action, cx: &mut App) {
@@ -100,6 +105,8 @@ fn open_main(cx: &mut App) {
         && win::exists(id)
     {
         st.visible.store(true, Relaxed);
+        // Devices may have changed while hidden (lists aren't refreshed then).
+        st.audio.send(audio::Command::Refresh);
         win::show(id);
         // Nothing was drawn while hidden: redraw now with fresh values.
         let _ = handle.update(cx, |_, window, _| window.refresh());
@@ -107,6 +114,7 @@ fn open_main(cx: &mut App) {
     }
 
     let status = st.audio.status.clone();
+    let params = st.audio.params.clone();
     let visible = st.visible.clone();
     visible.store(true, Relaxed);
     // Without a tray there would be no way back, so then closing really closes (and,
@@ -115,7 +123,7 @@ fn open_main(cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(380.0), px(560.0)),
+            size(px(400.0), px(800.0)),
             cx,
         ))),
         titlebar: Some(TitlebarOptions {
@@ -130,7 +138,7 @@ fn open_main(cx: &mut App) {
         if hide_on_close {
             window.on_window_should_close(cx, |_, cx| hide_main(cx));
         }
-        let view = cx.new(|cx| MainWindow::new(status, visible, cx));
+        let view = cx.new(|cx| MainWindow::new(status, params, visible, window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
     let st = cx.global_mut::<AppState>();

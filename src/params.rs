@@ -55,6 +55,17 @@ impl EqPreset {
         }
     }
 
+    /// How the window shows it (sentence case).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Natural => "Natural",
+            Self::Warm => "Warm",
+            Self::Clear => "Clear",
+            Self::Broadcast => "Broadcast",
+            Self::Custom => "Custom",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         Self::NAMED.into_iter().find(|p| p.name() == s)
     }

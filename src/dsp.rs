@@ -450,6 +450,11 @@ impl EngineSlot {
         self.den.name()
     }
 
+    /// The engine's delay, in samples.
+    pub fn latency(&self) -> usize {
+        self.den.latency()
+    }
+
     /// Denoise `a` and mix with the delayed dry signal, per-sample `strength`.
     fn process(&mut self, a: &[f32; FRAME], strength: &[f32; FRAME], out: &mut [f32; FRAME]) {
         self.den.process(a, out);

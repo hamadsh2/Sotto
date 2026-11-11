@@ -31,7 +31,7 @@ pub struct Named {
     pub device: Device,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     Input,
     Output,
@@ -104,12 +104,17 @@ fn pick(mut devices: Vec<Named>, query: &str, kind: &str) -> Result<Named, Strin
     }
 }
 
-pub fn find_input(host: &Host, query: &str) -> Result<Named, String> {
-    let mics = list(host, Dir::Input)?
+/// What the user may pick: microphones (never VB-Cable's own "CABLE Output"), or
+/// VB-Cable render endpoints only. Listing opens nothing.
+pub fn choices(host: &Host, dir: Dir) -> Result<Vec<Named>, String> {
+    Ok(list(host, dir)?
         .into_iter()
-        .filter(|d| !is_vb_cable(&d.name))
-        .collect();
-    pick(mics, query, "microphone")
+        .filter(|d| is_vb_cable(&d.name) == (dir == Dir::Output))
+        .collect())
+}
+
+pub fn find_input(host: &Host, query: &str) -> Result<Named, String> {
+    pick(choices(host, Dir::Input)?, query, "microphone")
 }
 
 /// Find the output. Only VB-Cable endpoints are ever considered.

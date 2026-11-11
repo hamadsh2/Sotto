@@ -51,6 +51,10 @@ pub struct Stats {
     pub active_engine: AtomicU8,
     /// Sequence number of the last engine switch the worker has completed.
     pub switch_done: AtomicU64,
+    /// Loudest sample of the raw mic / the cleaned output since the UI last read them,
+    /// as f32 bits (for the level meters).
+    level_in: AtomicU32,
+    level_out: AtomicU32,
 }
 
 impl Default for Stats {
@@ -82,6 +86,8 @@ impl Stats {
             engine_errors: AtomicU64::new(0),
             active_engine: AtomicU8::new(0),
             switch_done: AtomicU64::new(0),
+            level_in: AtomicU32::new(0),
+            level_out: AtomicU32::new(0),
         }
     }
 
@@ -103,6 +109,22 @@ impl Stats {
         let cdb = (info.limit_db.clamp(0.0, 100.0) * 100.0) as u32;
         self.limit_cdb.fetch_max(cdb, Relaxed);
         self.engine_errors.store(info.engine_errors, Relaxed);
+    }
+
+    /// Worker: remember the loudest sample of this frame's input and output, for the
+    /// meters. Atomics only. For non-negative floats the bit patterns sort like the
+    /// values, so an integer `fetch_max` keeps the larger level.
+    pub fn record_levels(&self, input: &[f32], output: &[f32]) {
+        self.level_in.fetch_max(peak(input).to_bits(), Relaxed);
+        self.level_out.fetch_max(peak(output).to_bits(), Relaxed);
+    }
+
+    /// UI: the loudest (input, output) sample since the last call, 0..=1, and reset.
+    pub fn take_levels(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.level_in.swap(0, Relaxed)),
+            f32::from_bits(self.level_out.swap(0, Relaxed)),
+        )
     }
 
     /// Render callback: record how many samples are queued right now. Atomics only.
@@ -152,6 +174,15 @@ impl Stats {
             max_ms,
         }
     }
+}
+
+/// Largest absolute sample, clamped to 0..=1; NaN counts as silence.
+fn peak(buf: &[f32]) -> f32 {
+    buf.iter()
+        .map(|x| x.abs())
+        .filter(|x| !x.is_nan())
+        .fold(0.0f32, f32::max)
+        .min(1.0)
 }
 
 /// Estimates clock drift between mic and cable with a least-squares line through
@@ -295,6 +326,17 @@ pub fn process_memory() -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn levels_keep_the_loudest_and_reset_on_read() {
+        let s = Stats::new();
+        s.record_levels(&[0.1, -0.5, 0.2], &[0.05]);
+        s.record_levels(&[0.3], &[-0.25, f32::NAN]);
+        assert_eq!(s.take_levels(), (0.5, 0.25));
+        assert_eq!(s.take_levels(), (0.0, 0.0));
+        s.record_levels(&[f32::INFINITY], &[f32::NAN]);
+        assert_eq!(s.take_levels(), (1.0, 0.0));
+    }
 
     #[test]
     fn percentiles_from_histogram() {

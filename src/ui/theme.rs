@@ -24,6 +24,8 @@ pub const TEXT_SECONDARY: u32 = 0xA39E94;
 pub const ACCENT: u32 = 0x8FA89A;
 pub const ACCENT_HOVER: u32 = 0xA3BBAE;
 pub const WARNING: u32 = 0xC48A72;
+/// Meter peak-hold tick and the top ~10% of the scale.
+pub const METER_PEAK: u32 = 0xC9B79C;
 
 // Type scale (px).
 pub const CAPTION: f32 = 11.0;

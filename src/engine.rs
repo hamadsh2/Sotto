@@ -166,6 +166,7 @@ impl Worker {
                             let info = chain.process(&frame, &params, &mut clean);
                             stats.record_frame(t0.elapsed());
                             stats.record_chain(&info);
+                            stats.record_levels(&frame, &clean);
                             last_frame = Some(t0);
                             if let Some(old) = chain.take_retired() {
                                 give_back(old);

@@ -70,17 +70,25 @@ pub enum Change {
     Stored,
 }
 
+/// A device the user chose: its exact Windows endpoint ID plus its name for messages.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Chosen {
+    pub id: DeviceId,
+    pub name: String,
+}
+
 pub struct Controller {
     host: Host,
-    input_id: DeviceId,
-    input_name: String,
-    output_id: DeviceId,
-    output_name: String,
+    /// `None` until the user picks one. Streams open only when both are chosen.
+    input: Option<Chosen>,
+    output: Option<Chosen>,
     pub params: Arc<Params>,
     pub stats: Arc<Stats>,
     worker: Option<engine::Worker>,
     streams: Option<engine::Engine>,
     engine_kind: EngineKind,
+    /// Delay of the engine last asked for, in samples.
+    engine_latency: usize,
     switch_seq: u64,
     lost_reported: bool,
     /// Counts stream (re)openings, so callers can reset clock-drift tracking.
@@ -97,24 +105,39 @@ impl Controller {
         kind: EngineKind,
         params: Arc<Params>,
     ) -> Result<Self, String> {
+        let mut ctl = Self::idle(kind, params)?;
+        let mic = devices::find_input(&ctl.host, input_query)?;
+        let cable = devices::find_output(&ctl.host, output_query)?;
+        ctl.input = Some(Chosen {
+            id: mic.id,
+            name: mic.name,
+        });
+        ctl.output = Some(Chosen {
+            id: cable.id,
+            name: cable.name,
+        });
+        Ok(ctl)
+    }
+
+    /// Start the denoise worker with no devices chosen yet: nothing is opened until
+    /// `select` has been called for both an input and an output.
+    pub fn idle(kind: EngineKind, params: Arc<Params>) -> Result<Self, String> {
         let host = cpal::default_host(); // WASAPI on Windows
-        let mic = devices::find_input(&host, input_query)?;
-        let cable = devices::find_output(&host, output_query)?;
         let stats = Arc::new(Stats::new());
         let mut notes = Vec::new();
         let first = make_engine(kind, &params, &mut notes)?;
+        let engine_latency = first.latency();
         let worker = engine::Worker::spawn(first, Arc::clone(&params), Arc::clone(&stats))?;
         Ok(Self {
             host,
-            input_id: mic.id,
-            input_name: mic.name,
-            output_id: cable.id,
-            output_name: cable.name,
+            input: None,
+            output: None,
             params,
             stats,
             worker: Some(worker),
             streams: None,
             engine_kind: kind,
+            engine_latency,
             switch_seq: 0,
             lost_reported: false,
             generation: 0,
@@ -122,17 +145,77 @@ impl Controller {
         })
     }
 
+    pub fn input(&self) -> Option<&Chosen> {
+        self.input.as_ref()
+    }
+
+    pub fn output(&self) -> Option<&Chosen> {
+        self.output.as_ref()
+    }
+
     pub fn input_name(&self) -> &str {
-        &self.input_name
+        self.input.as_ref().map_or("", |c| c.name.as_str())
     }
 
     pub fn output_name(&self) -> &str {
-        &self.output_name
+        self.output.as_ref().map_or("", |c| c.name.as_str())
+    }
+
+    /// The devices the user may choose from right now (mics; VB-Cable outputs only).
+    /// Only lists them — opens nothing.
+    pub fn choices(&self, dir: Dir) -> Result<Vec<Chosen>, String> {
+        Ok(devices::choices(&self.host, dir)?
+            .into_iter()
+            .map(|d| Chosen {
+                id: d.id,
+                name: d.name,
+            })
+            .collect())
+    }
+
+    /// Use the device with exactly this endpoint ID for `dir`. It must be in
+    /// `choices(dir)` now (so an output is always a VB-Cable endpoint). On a change the
+    /// streams stop and reopen on the new pair at the next `tick`; the old device is
+    /// released, and there is never a fallback to some other device.
+    pub fn select(&mut self, dir: Dir, id: &DeviceId) -> Result<(), String> {
+        let found = devices::choices(&self.host, dir)?
+            .into_iter()
+            .find(|d| &d.id == id)
+            .ok_or_else(|| match dir {
+                Dir::Input => "That microphone is not connected.".to_string(),
+                Dir::Output => "That VB-Cable output is not available.".to_string(),
+            })?;
+        let chosen = Some(Chosen {
+            id: found.id,
+            name: found.name,
+        });
+        let slot = match dir {
+            Dir::Input => &mut self.input,
+            Dir::Output => &mut self.output,
+        };
+        if *slot == chosen {
+            return Ok(());
+        }
+        *slot = chosen;
+        self.streams = None; // stops both streams; tick() opens the new pair
+        self.lost_reported = false;
+        Ok(())
+    }
+
+    /// Both devices are chosen (streams may still be waiting for one to appear).
+    pub fn has_devices(&self) -> bool {
+        self.input.is_some() && self.output.is_some()
     }
 
     /// The engine last asked for (the one heard is `stats.active_engine`).
     pub fn engine_kind(&self) -> EngineKind {
         self.engine_kind
+    }
+
+    /// Delay added by the chosen engine plus the one-frame (10 ms) collection, in ms.
+    /// The ring buffer's share is measured separately (`stats.take_buffer_avg`).
+    pub fn engine_latency_ms(&self) -> f64 {
+        (self.engine_latency + crate::denoise::FRAME) as f64 / 48.0
     }
 
     pub fn is_running(&self) -> bool {
@@ -180,22 +263,16 @@ impl Controller {
 
         // (Re)open. Only the two remembered endpoint IDs are ever looked up; if either
         // is missing we wait — never a fallback device.
-        if self.streams.is_none() {
+        if let (None, Some(mic), Some(cable)) = (&self.streams, &self.input, &self.output) {
             let attempt =
-                devices::find_by_id(&self.host, Dir::Input, &self.input_id, &self.input_name)
-                    .and_then(|i| {
-                        let o = devices::find_by_id(
-                            &self.host,
-                            Dir::Output,
-                            &self.output_id,
-                            &self.output_name,
-                        )?;
-                        self.stats.input_failed.store(false, Relaxed);
-                        self.stats.output_failed.store(false, Relaxed);
-                        devices::no_panic("opening streams", || {
-                            engine::start(&i, &o, worker, Arc::clone(&self.stats))
-                        })
-                    });
+                devices::find_by_id(&self.host, Dir::Input, &mic.id, &mic.name).and_then(|i| {
+                    let o = devices::find_by_id(&self.host, Dir::Output, &cable.id, &cable.name)?;
+                    self.stats.input_failed.store(false, Relaxed);
+                    self.stats.output_failed.store(false, Relaxed);
+                    devices::no_panic("opening streams", || {
+                        engine::start(&i, &o, worker, Arc::clone(&self.stats))
+                    })
+                });
             match attempt {
                 Ok(e) => {
                     // Drop numbers left over from before a disconnect.
@@ -258,19 +335,23 @@ impl Controller {
         match make_engine(kind, &self.params, &mut self.notes) {
             // Count the switch only once the worker has it, so a failed send can't leave
             // every later switch stuck at `Busy`.
-            Ok(slot) => match worker.set_engine(slot, self.switch_seq + 1) {
-                Ok(()) => {
-                    self.switch_seq += 1;
-                    self.engine_kind = kind;
-                    Ok(Change::Started)
-                }
-                Err(e) => {
-                    if let Some(old) = old_pf {
-                        self.params.dfn_postfilter.store(old, Relaxed);
+            Ok(slot) => {
+                let latency = slot.latency();
+                match worker.set_engine(slot, self.switch_seq + 1) {
+                    Ok(()) => {
+                        self.engine_latency = latency;
+                        self.switch_seq += 1;
+                        self.engine_kind = kind;
+                        Ok(Change::Started)
                     }
-                    Err(e)
+                    Err(e) => {
+                        if let Some(old) = old_pf {
+                            self.params.dfn_postfilter.store(old, Relaxed);
+                        }
+                        Err(e)
+                    }
                 }
-            },
+            }
             Err(e) => {
                 if let Some(old) = old_pf {
                     self.params.dfn_postfilter.store(old, Relaxed);
