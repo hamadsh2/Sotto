@@ -133,12 +133,12 @@ jobs:
 
       - name: SHA-256 sums
         run: |
-          Push-Location dist
-          Get-ChildItem -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object {
-            "$((Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-          } | Set-Content -Encoding ascii SHA256SUMS.txt
-          Get-Content SHA256SUMS.txt
-          Pop-Location
+          # "<hash>  <name>" lines with LF endings, so `sha256sum -c` works everywhere.
+          $lines = Get-ChildItem dist -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          }
+          [IO.File]::WriteAllText("$PWD\dist\SHA256SUMS.txt", ($lines -join "`n") + "`n")
+          Get-Content dist\SHA256SUMS.txt
 
       - name: Attach files to this run
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
