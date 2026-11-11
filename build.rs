@@ -34,6 +34,8 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let res = out.join("sotto-icon.res");
     std::fs::write(&res, icon_res()).expect("write icon resource");
+    // The same icon as a .ico file, for the installer (CI picks it up from OUT_DIR).
+    std::fs::write(out.join("sotto.ico"), icon_file()).expect("write icon file");
     // link.exe accepts .res files as inputs. Only the window app gets the icon.
     println!("cargo:rustc-link-arg-bin=sotto={}", res.display());
 }
@@ -81,6 +83,30 @@ fn entry(res: &mut Vec<u8>, kind: u16, id: u16, flags: u16, data: &[u8]) {
     while !res.len().is_multiple_of(4) {
         res.push(0);
     }
+}
+
+/// A standalone .ico: a directory of the images (16-byte entries with each image's
+/// offset in the file), then the images themselves.
+fn icon_file() -> Vec<u8> {
+    let images: Vec<(u32, Vec<u8>)> = SIZES.iter().map(|&s| (s, dib(s))).collect();
+    let mut f = Vec::new();
+    for w in [0u16, 1, images.len() as u16] {
+        f.extend_from_slice(&w.to_le_bytes());
+    }
+    let mut offset = 6 + 16 * images.len() as u32;
+    for (size, img) in &images {
+        let b = if *size >= 256 { 0 } else { *size as u8 }; // 0 means 256
+        f.extend_from_slice(&[b, b, 0, 0]);
+        f.extend_from_slice(&1u16.to_le_bytes()); // planes
+        f.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+        f.extend_from_slice(&(img.len() as u32).to_le_bytes());
+        f.extend_from_slice(&offset.to_le_bytes());
+        offset += img.len() as u32;
+    }
+    for (_, img) in &images {
+        f.extend_from_slice(img);
+    }
+    f
 }
 
 fn icon_res() -> Vec<u8> {

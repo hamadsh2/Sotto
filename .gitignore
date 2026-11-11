@@ -38,3 +38,6 @@ secrets/
 
 # Claude Code local-only settings
 .claude/settings.local.json
+
+# Installer and release files built locally
+dist/

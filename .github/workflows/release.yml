@@ -1,0 +1,189 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Builds Sotto for Windows and, on a version tag (v1.2.3), creates a DRAFT GitHub
+# Release with the installer, the signed update zip and SHA256SUMS.txt. A draft is
+# invisible until a maintainer presses "Publish".
+#
+# Run it by hand (Actions -> Release -> Run workflow) for a test build: everything is
+# built, signed and checked, and the files are attached to the run, but no release is
+# made.
+#
+# Security:
+# - Third-party actions are pinned to full commit SHAs (tag in the comment).
+# - The update-signing key comes only from the ZIPSIGN_KEY secret (base64 of the
+#   64-byte zipsign key). It is written to the runner's temp folder for the one signing
+#   command, deleted right after, and never printed.
+# - Inno Setup is downloaded from its official GitHub release and its SHA-256 is
+#   checked before it runs.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.99.1"
+  ZIPSIGN_VERSION: "0.2.2"
+  INNO_URL: "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe"
+  INNO_SHA256: "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and sign
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --component rustfmt,clippy
+          rustup default $env:RUST_VERSION
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Read version
+        id: version
+        run: |
+          $m = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $m) { throw "No version in Cargo.toml" }
+          $v = $m.Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "Tag $env:GITHUB_REF_NAME doesn't match Cargo.toml version $v"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "Building Sotto $v"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package the update zip
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target\release\sotto.exe -DestinationPath "dist\sotto-$v-windows-x64.zip"
+
+      - name: Install zipsign ${{ env.ZIPSIGN_VERSION }}
+        run: cargo install zipsign --version $env:ZIPSIGN_VERSION --locked
+
+      - name: Sign the update zip
+        env:
+          ZIPSIGN_KEY: ${{ secrets.ZIPSIGN_KEY }}
+        run: |
+          if (-not $env:ZIPSIGN_KEY) { throw "The ZIPSIGN_KEY secret is missing" }
+          $key = Join-Path $env:RUNNER_TEMP "sotto-update.key"
+          try {
+            [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:ZIPSIGN_KEY.Trim()))
+            zipsign sign zip "dist\sotto-${{ steps.version.outputs.version }}-windows-x64.zip" $key
+            if ($LASTEXITCODE -ne 0) { throw "zipsign failed" }
+          } finally {
+            Remove-Item $key -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Check the signature with the key built into Sotto
+        run: |
+          zipsign verify zip "dist\sotto-${{ steps.version.outputs.version }}-windows-x64.zip" assets\update\sotto-update.pub
+          if ($LASTEXITCODE -ne 0) { throw "The update zip doesn't verify with assets/update/sotto-update.pub" }
+
+      - name: Install Inno Setup
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP "innosetup.exe"
+          Invoke-WebRequest -Uri $env:INNO_URL -OutFile $exe
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:INNO_SHA256) { throw "Inno Setup download hash mismatch: $hash" }
+          $dir = Join-Path $env:RUNNER_TEMP "inno"
+          Start-Process $exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-","/DIR=`"$dir`"" -Wait
+          if (-not (Test-Path "$dir\ISCC.exe")) { throw "Inno Setup didn't install" }
+          "INNO_DIR=$dir" >> $env:GITHUB_ENV
+
+      - name: Build the installer
+        run: |
+          $ico = Get-ChildItem target\release\build\sotto-*\out\sotto.ico | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $ico) { throw "sotto.ico not found (written by build.rs)" }
+          & "$env:INNO_DIR\ISCC.exe" "/DAppVersion=${{ steps.version.outputs.version }}" "/DBinDir=$PWD\target\release" "/DIconFile=$($ico.FullName)" installer\sotto.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: SHA-256 sums
+        run: |
+          Push-Location dist
+          Get-ChildItem -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+          Pop-Location
+
+      - name: Attach files to this run
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sotto-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Draft release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Get the files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sotto-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          {
+            echo "Sotto ${VERSION} for Windows 10/11 (64-bit)."
+            echo
+            echo "**Install:** download \`Sotto-${VERSION}-setup.exe\` and run it (no admin rights needed)."
+            echo "Sotto needs VB-Cable: https://vb-audio.com/Cable/"
+            echo
+            echo "Sotto never touches your headphones, speakers, or Windows audio settings."
+            echo
+            echo "Official builds are published only on this repository's Releases page."
+            echo
+            echo "### SHA-256"
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } > notes.md
+          gh release create "v${VERSION}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft \
+            --title "Sotto ${VERSION}" \
+            --notes-file notes.md
