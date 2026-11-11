@@ -1184,7 +1184,7 @@ impl MainWindow {
             ),
             UpdateState::Available(v) => (
                 format!("Sotto {v} is available").into(),
-                format!("You have {current}. Signed and checked before installing.").into(),
+                format!("You have {current} · signature checked first").into(),
                 Some(("Install", install_update)),
             ),
             UpdateState::Installing(v) => (
