@@ -1,4 +1,4 @@
-The icons in this folder (chevron-down, check, mic, plug) are from Lucide
+The icons in this folder (chevron-down, chevron-right, check, mic, plug) are from Lucide
 (https://lucide.dev), used under the ISC License:
 
 ISC License

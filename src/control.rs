@@ -202,6 +202,33 @@ impl Controller {
         Ok(())
     }
 
+    /// Bring back a device chosen in an earlier session (from the settings file). It
+    /// may be unplugged right now: then the streams wait for exactly that device (by ID,
+    /// or exact full name). An output is accepted only if its name is a VB-Cable one,
+    /// and `find_chosen` again only ever finds VB-Cable endpoints for it.
+    pub fn restore(&mut self, dir: Dir, id: &str, name: &str) -> Result<(), String> {
+        let id: DeviceId = id
+            .parse()
+            .map_err(|_| "Saved device ID is invalid.".to_string())?;
+        if dir == Dir::Output && !devices::is_vb_cable(name) {
+            return Err("The saved output isn't a VB-Cable device; choose it again.".into());
+        }
+        if dir == Dir::Input && devices::is_vb_cable(name) {
+            return Err("The saved microphone is a VB-Cable device; choose it again.".into());
+        }
+        let chosen = Some(Chosen {
+            id,
+            name: name.to_string(),
+        });
+        match dir {
+            Dir::Input => self.input = chosen,
+            Dir::Output => self.output = chosen,
+        }
+        self.streams = None;
+        self.lost_reported = false;
+        Ok(())
+    }
+
     /// Both devices are chosen (streams may still be waiting for one to appear).
     pub fn has_devices(&self) -> bool {
         self.input.is_some() && self.output.is_some()
@@ -264,17 +291,24 @@ impl Controller {
         // (Re)open. Only the two remembered endpoint IDs are ever looked up; if either
         // is missing we wait — never a fallback device.
         if let (None, Some(mic), Some(cable)) = (&self.streams, &self.input, &self.output) {
-            let attempt =
-                devices::find_by_id(&self.host, Dir::Input, &mic.id, &mic.name).and_then(|i| {
-                    let o = devices::find_by_id(&self.host, Dir::Output, &cable.id, &cable.name)?;
+            let attempt = devices::find_chosen(&self.host, Dir::Input, &mic.id, &mic.name)
+                .and_then(|i| {
+                    let o = devices::find_chosen(&self.host, Dir::Output, &cable.id, &cable.name)?;
                     self.stats.input_failed.store(false, Relaxed);
                     self.stats.output_failed.store(false, Relaxed);
-                    devices::no_panic("opening streams", || {
-                        engine::start(&i, &o, worker, Arc::clone(&self.stats))
-                    })
+                    let e = devices::no_panic("opening streams", || {
+                        engine::start(&i.device, &o.device, worker, Arc::clone(&self.stats))
+                    })?;
+                    Ok((e, i.id, o.id))
                 });
             match attempt {
-                Ok(e) => {
+                Ok((e, in_id, out_id)) => {
+                    // Found by its exact name under a new ID: remember the new one.
+                    for (slot, id) in [(&mut self.input, in_id), (&mut self.output, out_id)] {
+                        if let Some(c) = slot.as_mut() {
+                            c.id = id;
+                        }
+                    }
                     // Drop numbers left over from before a disconnect.
                     let _ = self.stats.take_timing();
                     let _ = self.stats.take_buffer_avg();

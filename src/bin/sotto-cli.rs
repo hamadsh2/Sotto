@@ -230,6 +230,19 @@ fn run() -> Result<(), String> {
     if args.list {
         return devices::print_list(&cpal::default_host());
     }
+    // Only one Sotto may write to CABLE Input. `_claim` holds the shared lock until
+    // `run` returns.
+    let _claim = match sotto::instance::claim() {
+        sotto::instance::Outcome::Taken => {
+            return Err(
+                "Sotto is already running (the window app or another sotto-cli). \
+                        Quit it from its tray icon first."
+                    .into(),
+            );
+        }
+        sotto::instance::Outcome::Alone(c) => Some(c),
+        sotto::instance::Outcome::Unknown => None,
+    };
     let Some(input_query) = args.input.as_deref() else {
         devices::print_list(&cpal::default_host())?;
         return Err("choose a microphone with --input \"<name>\"".into());

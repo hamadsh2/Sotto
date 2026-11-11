@@ -9,5 +9,7 @@ pub mod dfn;
 pub mod dsp;
 pub mod engine;
 pub mod eq;
+pub mod instance;
 pub mod params;
+pub mod settings;
 pub mod stats;

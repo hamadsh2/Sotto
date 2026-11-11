@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! The main window: engine selector, strength, level meters, device pickers, the
-//! voice-chain switches, warnings, and a CPU · latency readout.
+//! voice-chain switches (with fine settings that open under their row), warnings, and
+//! a CPU · latency readout.
 //!
 //! How the controls reach the audio (see `audio.rs`):
-//! - strength and the stage switches write `Params` atomics directly — instant, no lock;
-//! - engine and device choices are sent as commands to the control thread.
+//! - strength, the stage switches and their fine settings write `Params` atomics
+//!   directly — instant, no lock;
+//! - engine, post-filter and device choices are sent as commands to the control thread.
+//!
+//! Every change also asks for a delayed save of the settings file (`super::save_soon`).
 //!
 //! Redraws: about 30 a second while visible, and only while a meter is moving or once
 //! a second for the readouts. While hidden: no redraw at all — the loop just wakes once
@@ -19,24 +23,27 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    Window, div, px, relative, svg,
+    AnyElement, App, AppContext, ClickEvent, Context, Div, Entity, FontWeight, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, div, px, relative, svg,
 };
-use gpui_component::IndexPath;
+use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::switch::Switch;
+use gpui_component::{Disableable, IndexPath, Sizable};
 use sotto::control::EngineKind;
 use sotto::devices::{Dir, VB_CABLE_URL};
-use sotto::params::Params;
+use sotto::params::{
+    AGC_MAX_DB_MAX, AGC_MAX_DB_MIN, EQ_DB_LIMIT, EqPreset, GATE_DB_MAX, GATE_DB_MIN, Params,
+};
 use sotto::stats;
 
-use super::AppState;
 use super::assets;
 use super::audio::{Command, Device, State, Status};
-use super::meter::Meter;
+use super::meter::{self, Meter};
 use super::theme::*;
+use super::{AppState, save_soon};
 
 /// Meter frame interval while visible (~30 Hz).
 const METER_EVERY: Duration = Duration::from_millis(33);
@@ -44,6 +51,7 @@ const METER_EVERY: Duration = Duration::from_millis(33);
 const HIDDEN_EVERY: Duration = Duration::from_secs(1);
 /// Content column width cap, so a wide (e.g. tiled) window keeps short lines.
 const MAX_CONTENT_W: f32 = 520.0;
+const EQ_BANDS: [&str; 3] = ["Body", "Mud", "Presence"];
 
 impl SelectItem for Device {
     type Value = String;
@@ -55,18 +63,161 @@ impl SelectItem for Device {
     fn value(&self) -> &String {
         &self.id
     }
+
+    /// A row in the open list. gpui-component pads each row (8 px sides, 4 px top and
+    /// bottom) and sets no cursor; this stretches over that padding so the whole row
+    /// shows the hand.
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .mx(-SP_8)
+            .my(-SP_4)
+            .px(SP_8)
+            .py(SP_4)
+            .cursor_pointer()
+            .child(self.name.clone())
+    }
 }
 
 type DeviceSelect = Entity<SelectState<Vec<Device>>>;
+
+/// The voice-chain stages, in chain order.
+#[derive(Clone, Copy, PartialEq)]
+enum Stage {
+    Hpf,
+    Eq,
+    Gate,
+    Agc,
+    Limiter,
+}
+
+impl Stage {
+    const ALL: [Stage; 5] = [Self::Hpf, Self::Eq, Self::Gate, Self::Agc, Self::Limiter];
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Hpf => "hpf",
+            Self::Eq => "eq",
+            Self::Gate => "gate",
+            Self::Agc => "agc",
+            Self::Limiter => "limiter",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hpf => "Low-cut filter",
+            Self::Eq => "Voice EQ",
+            Self::Gate => "Noise gate",
+            Self::Agc => "Auto gain",
+            Self::Limiter => "Limiter",
+        }
+    }
+
+    /// The `Params` switch for this stage.
+    fn flag(self, p: &Params) -> &AtomicBool {
+        match self {
+            Self::Hpf => &p.hpf,
+            Self::Eq => &p.eq,
+            Self::Gate => &p.gate,
+            Self::Agc => &p.agc,
+            Self::Limiter => &p.limiter,
+        }
+    }
+
+    /// Has fine settings that open under its row.
+    fn tunable(self) -> bool {
+        matches!(self, Self::Eq | Self::Gate | Self::Agc)
+    }
+
+    /// The small line under the label: what it does, or its current value.
+    fn hint(self, p: &Params) -> String {
+        match self {
+            Self::Hpf => "Removes rumble below 80 Hz".into(),
+            Self::Eq => p.eq_preset().label().into(),
+            Self::Gate => format!("Opens at {}", db(p.gate_threshold_db())),
+            Self::Agc => format!("Up to {}", db_signed(p.agc_max_db())),
+            Self::Limiter => "Stops sudden peaks".into(),
+        }
+    }
+}
+
+/// "−45 dB" with a real minus sign (U+2212), not a hyphen.
+fn db(v: f32) -> String {
+    format!("{v:.0} dB").replace('-', "\u{2212}")
+}
+
+/// "+12 dB" / "−1.5 dB" / "0 dB".
+fn db_signed(v: f32) -> String {
+    let s = if v.fract().abs() > 0.01 {
+        format!("{v:+.1} dB")
+    } else {
+        format!("{v:+.0} dB")
+    };
+    match s.as_str() {
+        "+0 dB" | "-0 dB" => "0 dB".into(),
+        _ => s.replace('-', "\u{2212}"),
+    }
+}
+
+/// A value beside a slider that can also be typed in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Strength,
+    Gate,
+    Agc,
+    Eq(usize),
+}
+
+impl Field {
+    fn id(self) -> SharedString {
+        match self {
+            Field::Strength => "val-strength".into(),
+            Field::Gate => "val-gate".into(),
+            Field::Agc => "val-agc".into(),
+            Field::Eq(i) => format!("val-eq-{i}").into(),
+        }
+    }
+
+    /// The slider's step: typed values are rounded to it, so slider and text agree.
+    fn step(self) -> f32 {
+        match self {
+            Field::Eq(_) => 0.5,
+            _ => 1.0,
+        }
+    }
+}
+
+/// Read a typed number: "-45", "−45 dB", "+12", "80%", " 3.5 " all work. `None` if it
+/// isn't a number (then the old value stays).
+fn parse_number(text: &str) -> Option<f32> {
+    let t = text
+        .trim()
+        .replace('\u{2212}', "-")
+        .to_lowercase()
+        .replace("db", "")
+        .replace('%', "");
+    let v: f32 = t.trim().trim_start_matches('+').trim().parse().ok()?;
+    v.is_finite().then_some(v)
+}
 
 pub struct MainWindow {
     status: Arc<Mutex<Status>>,
     params: Arc<Params>,
     strength: Entity<SliderState>,
+    gate: Entity<SliderState>,
+    agc: Entity<SliderState>,
+    eq: [Entity<SliderState>; 3],
     input_select: DeviceSelect,
     output_select: DeviceSelect,
     /// What the pickers currently show, to update them only when something changed.
     shown: [(Vec<Device>, Option<String>); 2],
+    /// The stage whose fine settings are open (one at a time).
+    expanded: Option<Stage>,
+    /// Set if Windows refused to add/remove the "Start with Windows" entry.
+    autostart_error: Option<String>,
+    /// The value being typed in (one at a time) and its text box.
+    editing: Option<Field>,
+    edit: Entity<InputState>,
     meter_in: Meter,
     meter_out: Meter,
     cpu_pct: f64,
@@ -83,6 +234,16 @@ fn send(cmd: Command, cx: &mut App) {
     cx.global::<AppState>().audio.send(cmd);
 }
 
+fn slider(cx: &mut App, min: f32, max: f32, step: f32, value: f32) -> Entity<SliderState> {
+    cx.new(|_| {
+        SliderState::new()
+            .min(min)
+            .max(max)
+            .step(step)
+            .default_value(value)
+    })
+}
+
 impl MainWindow {
     pub fn new(
         status: Arc<Mutex<Status>>,
@@ -91,19 +252,56 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let strength = cx.new(|_| {
-            SliderState::new()
-                .min(0.0)
-                .max(100.0)
-                .step(1.0)
-                .default_value(params.strength() * 100.0)
-        });
-        let p = Arc::clone(&params);
-        let mut subs = vec![cx.subscribe(&strength, move |_, _, ev: &SliderEvent, cx| {
-            let SliderEvent::Change(v) = ev;
-            p.set_strength(v.start() / 100.0);
-            cx.notify();
-        })];
+        let strength = slider(cx, 0.0, 100.0, 1.0, params.strength() * 100.0);
+        let gate = slider(
+            cx,
+            GATE_DB_MIN,
+            GATE_DB_MAX,
+            1.0,
+            params.gate_threshold_db(),
+        );
+        let agc = slider(cx, AGC_MAX_DB_MIN, AGC_MAX_DB_MAX, 1.0, params.agc_max_db());
+        let custom = cx.global::<AppState>().settings.eq_custom;
+        let eq = [0, 1, 2].map(|i| slider(cx, -EQ_DB_LIMIT, EQ_DB_LIMIT, 0.5, custom[i]));
+
+        // Each slider writes its `Params` value (clamped there) and asks for a save.
+        let mut subs = Vec::new();
+        let on_slide = |cx: &mut Context<Self>, s: &Entity<SliderState>, set: fn(&Params, f32)| {
+            let p = Arc::clone(&params);
+            cx.subscribe(s, move |_, _, ev: &SliderEvent, cx| {
+                let SliderEvent::Change(v) = ev;
+                set(&p, v.start());
+                save_soon(cx);
+                cx.notify();
+            })
+        };
+        subs.push(on_slide(cx, &strength, |p, v| p.set_strength(v / 100.0)));
+        subs.push(on_slide(cx, &gate, |p, v| p.set_gate_threshold_db(v)));
+        subs.push(on_slide(cx, &agc, |p, v| p.set_agc_max_db(v)));
+        for (i, band) in eq.iter().enumerate() {
+            let p = Arc::clone(&params);
+            subs.push(cx.subscribe(band, move |_, _, ev: &SliderEvent, cx| {
+                let SliderEvent::Change(v) = ev;
+                let mut gains = cx.global::<AppState>().settings.eq_custom;
+                gains[i] = v.start();
+                p.set_eq_custom(gains);
+                // Remember them now, so picking a named preset and coming back to
+                // Custom brings them back even before the next save.
+                cx.global_mut::<AppState>().settings.eq_custom = p.eq_gains();
+                save_soon(cx);
+                cx.notify();
+            }));
+        }
+
+        // One text box, shown in place of whichever value is being typed.
+        let edit = cx.new(|cx| InputState::new(window, cx));
+        subs.push(
+            cx.subscribe_in(&edit, window, |this, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_edit(window, cx);
+                }
+            }),
+        );
 
         let input_select = cx.new(|cx| SelectState::new(Vec::<Device>::new(), None, window, cx));
         let output_select = cx.new(|cx| SelectState::new(Vec::<Device>::new(), None, window, cx));
@@ -112,6 +310,7 @@ impl MainWindow {
                 cx.subscribe(sel, move |_, _, ev: &SelectEvent<Vec<Device>>, cx| {
                     if let SelectEvent::Confirm(Some(id)) = ev {
                         send(Command::Select(dir, id.clone()), cx);
+                        save_soon(cx);
                     }
                 }),
             );
@@ -142,10 +341,13 @@ impl MainWindow {
                         this.meter_out.reset();
                         return;
                     }
-                    let moving = this.meter_in.is_moving() || this.meter_out.is_moving();
+                    let was_moving = this.meter_in.is_moving() || this.meter_out.is_moving();
                     this.meter_in.update(lin, dt);
                     this.meter_out.update(lout, dt);
-                    if moving || this.meter_in.is_moving() || second {
+                    let moving = this.meter_in.is_moving() || this.meter_out.is_moving();
+                    // Draw while moving, one last frame when they come to rest, and
+                    // once a second for the readouts.
+                    if was_moving || moving || second {
                         cx.notify();
                     }
                 });
@@ -159,9 +361,16 @@ impl MainWindow {
             status,
             params,
             strength,
+            gate,
+            agc,
+            eq,
             input_select,
             output_select,
             shown: Default::default(),
+            expanded: None,
+            autostart_error: None,
+            editing: None,
+            edit,
             meter_in: Meter::default(),
             meter_out: Meter::default(),
             cpu_pct: 0.0,
@@ -213,7 +422,8 @@ impl MainWindow {
         }
     }
 
-    /// Noise removal card: engine segments, what the engine is for, and strength.
+    /// Noise removal card: engine segments, what the engine is for, strength, and the
+    /// post-filter switch while High quality is selected.
     fn engine_card(&self, st: &Status, cx: &mut Context<Self>) -> impl IntoElement {
         let current = st.loading.or(st.engine);
         let segments = [
@@ -228,46 +438,178 @@ impl MainWindow {
             (None, Some(k)) => k.label(),
             (None, None) => "",
         };
+        let pf_on = self.params.dfn_postfilter.load(Relaxed);
+        let loading = st.loading.is_some();
         card("Noise removal")
-            .child(
-                div()
-                    .flex()
-                    .gap(SP_4)
-                    .p(SP_4)
-                    .bg(c(BG))
-                    .rounded(RADIUS_CONTROL)
-                    .children(segments.into_iter().map(|(kind, title)| {
-                        let selected = current == Some(kind);
-                        div()
-                            .id(kind.name())
-                            .flex_1()
-                            .h(px(32.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(RADIUS_CONTROL)
-                            .text_size(px(LABEL))
-                            .font_weight(FontWeight::MEDIUM)
-                            .cursor_pointer()
-                            .map(|d| {
-                                if selected {
-                                    d.bg(c(ACCENT)).text_color(c(BG))
-                                } else {
-                                    d.text_color(c(TEXT_SECONDARY))
-                                        .hover(|s| s.bg(c(ELEVATED)).text_color(c(TEXT_PRIMARY)))
-                                }
-                            })
-                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                send(Command::SetEngine(kind), cx);
-                            }))
-                            .child(title)
-                    })),
-            )
+            .child(segmented(
+                segments.into_iter().map(|(kind, title)| {
+                    (
+                        SharedString::from(kind.name()),
+                        title,
+                        current == Some(kind),
+                        Box::new(move |cx: &mut App| {
+                            send(Command::SetEngine(kind), cx);
+                            save_soon(cx);
+                        }) as Box<dyn Fn(&mut App)>,
+                    )
+                }),
+                LABEL,
+                32.0,
+            ))
             .child(div().mb(SP_8).child(caption(hint)))
-            .child(self.strength_row(st))
+            .child(self.strength_row(st, cx))
+            .when(st.engine == Some(EngineKind::Dfn), |d| {
+                d.child(
+                    div()
+                        .mt(SP_8)
+                        .pt(SP_12)
+                        .border_t_1()
+                        .border_color(c(BORDER))
+                        .flex()
+                        .items_center()
+                        .gap(SP_12)
+                        .child(div().flex_1().flex().flex_col().child("Post-filter").child(
+                            caption("Removes more leftover noise. Can sound a little thinner."),
+                        ))
+                        .child(
+                            div().when(!loading, |d| d.cursor_pointer()).child(
+                                Switch::new("postfilter")
+                                    .checked(pf_on)
+                                    .disabled(loading)
+                                    .on_click(|on: &bool, _, cx| {
+                                        send(Command::SetPostFilter(*on), cx);
+                                        save_soon(cx);
+                                    }),
+                            ),
+                        ),
+                )
+            })
     }
 
-    fn strength_row(&self, st: &Status) -> impl IntoElement {
+    /// The value as plain text for typing (a normal minus, no unit).
+    fn edit_text(&self, f: Field) -> String {
+        let p = &self.params;
+        let v = match f {
+            Field::Strength => p.strength() * 100.0,
+            Field::Gate => p.gate_threshold_db(),
+            Field::Agc => p.agc_max_db(),
+            Field::Eq(i) => p.eq_gains()[i],
+        };
+        if v.fract().abs() > 0.01 {
+            format!("{v:.1}")
+        } else {
+            format!("{v:.0}")
+        }
+    }
+
+    fn start_edit(&mut self, f: Field, window: &mut Window, cx: &mut Context<Self>) {
+        // Clicking another value while typing applies the first one.
+        self.commit_edit(window, cx);
+        self.editing = Some(f);
+        let text = self.edit_text(f);
+        self.edit.update(cx, |s, cx| s.set_value(text, window, cx));
+        // Once the box has been drawn: focus it again (if this click also activated the
+        // window, GPUI applies that activation afterwards and the first focus is lost),
+        // then select the text so typing replaces it.
+        let edit = self.edit.clone();
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| {
+                edit.update(cx, |s, cx| s.focus(window, cx));
+                window.dispatch_action(Box::new(SelectAll), cx);
+            });
+        });
+        cx.notify();
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        cx.notify();
+    }
+
+    /// Apply the typed value (rounded to the slider's step, clamped by the same setters
+    /// the sliders use), move the slider to match, and save.
+    fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(f) = self.editing.take() else {
+            return;
+        };
+        let text = self.edit.read(cx).value();
+        if let Some(v) = parse_number(&text) {
+            let v = (v / f.step()).round() * f.step();
+            let p = Arc::clone(&self.params);
+            let (slider, shown) = match f {
+                Field::Strength => {
+                    p.set_strength(v / 100.0);
+                    (&self.strength, p.strength() * 100.0)
+                }
+                Field::Gate => {
+                    p.set_gate_threshold_db(v);
+                    (&self.gate, p.gate_threshold_db())
+                }
+                Field::Agc => {
+                    p.set_agc_max_db(v);
+                    (&self.agc, p.agc_max_db())
+                }
+                Field::Eq(i) => {
+                    let mut gains = cx.global::<AppState>().settings.eq_custom;
+                    gains[i] = v;
+                    p.set_eq_custom(gains);
+                    cx.global_mut::<AppState>().settings.eq_custom = p.eq_gains();
+                    (&self.eq[i], p.eq_gains()[i])
+                }
+            };
+            slider.update(cx, |s, cx| s.set_value(shown, window, cx));
+            save_soon(cx);
+        }
+        cx.notify();
+    }
+
+    /// The value beside a slider. Click it to type a number instead of dragging.
+    fn value_cell(
+        &self,
+        f: Field,
+        text: String,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.editing == Some(f) {
+            return div()
+                .w(px(VALUE_W))
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.cancel_edit(cx);
+                    }
+                }))
+                .on_mouse_down_out(cx.listener(|this, _, window, cx| this.commit_edit(window, cx)))
+                .child(Input::new(&self.edit).small())
+                .into_any_element();
+        }
+        div()
+            .id(f.id())
+            .w(px(VALUE_W))
+            .flex()
+            .justify_end()
+            .text_color(c(if enabled {
+                TEXT_PRIMARY
+            } else {
+                TEXT_SECONDARY
+            }))
+            .child(
+                div()
+                    .px(SP_4)
+                    .rounded(RADIUS_CONTROL)
+                    .when(enabled, |d| d.hover(|d| d.bg(c(ELEVATED))))
+                    .child(text),
+            )
+            .when(enabled, |d| {
+                d.cursor_pointer()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.start_edit(f, window, cx)
+                    }))
+            })
+            .into_any_element()
+    }
+
+    fn strength_row(&self, st: &Status, cx: &mut Context<Self>) -> impl IntoElement {
         let off = st.engine == Some(EngineKind::Off);
         let value = (self.params.strength() * 100.0).round();
         div()
@@ -275,22 +617,8 @@ impl MainWindow {
             .items_center()
             .gap(SP_12)
             .child(div().w(px(64.0)).child("Strength"))
-            .child(
-                // gpui-component's controls don't ask for a hand cursor, so each sits in
-                // a box that does (only while it can be used).
-                div()
-                    .flex_1()
-                    .when(!off, |d| d.cursor_pointer())
-                    .child(Slider::new(&self.strength).disabled(off)),
-            )
-            .child(
-                div()
-                    .w(px(36.0))
-                    .flex()
-                    .justify_end()
-                    .text_color(c(if off { TEXT_SECONDARY } else { TEXT_PRIMARY }))
-                    .child(format!("{value:.0}%")),
-            )
+            .child(slider_box(&self.strength, !off))
+            .child(self.value_cell(Field::Strength, format!("{value:.0}%"), !off, cx))
     }
 
     /// One device row: icon, small label, and a borderless dropdown (its own chevron).
@@ -301,7 +629,7 @@ impl MainWindow {
         sel: &DeviceSelect,
         placeholder: &'static str,
         empty: bool,
-    ) -> gpui::Div {
+    ) -> Div {
         div()
             .flex()
             .items_center()
@@ -322,6 +650,8 @@ impl MainWindow {
                     .flex_col()
                     .child(caption(label))
                     .child(
+                        // gpui-component's controls don't ask for a hand cursor, so
+                        // each sits in a box that does (only while it can be used).
                         div().when(!empty, |d| d.cursor_pointer()).child(
                             Select::new(sel)
                                 .placeholder(placeholder)
@@ -333,10 +663,241 @@ impl MainWindow {
                     ),
             )
     }
+
+    /// One voice-chain row: label + current value (click to open fine settings, for
+    /// stages that have them), and its on/off switch.
+    fn stage_row(&self, stage: Stage, cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.params;
+        let on = stage.flag(p).load(Relaxed);
+        let open = self.expanded == Some(stage);
+        let params = Arc::clone(p);
+        let head = div()
+            .id(stage.id())
+            .flex_1()
+            .flex()
+            .items_center()
+            .gap(SP_8)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(stage.label())
+                    .child(caption(stage.hint(p))),
+            )
+            .when(stage.tunable(), |d| {
+                d.cursor_pointer()
+                    .child(
+                        svg()
+                            .path(if open {
+                                assets::CHEVRON_DOWN
+                            } else {
+                                assets::CHEVRON_RIGHT
+                            })
+                            .size(px(14.0))
+                            .text_color(c(TEXT_SECONDARY)),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.expanded = if open { None } else { Some(stage) };
+                        cx.notify();
+                    }))
+            });
+        div()
+            .flex()
+            .flex_col()
+            .py(SP_12)
+            .child(
+                div().flex().items_center().gap(SP_12).child(head).child(
+                    div()
+                        .cursor_pointer()
+                        .child(Switch::new(stage.id()).checked(on).on_click(
+                            move |checked: &bool, window, cx| {
+                                // Read by the audio thread on its next frame; no lock.
+                                stage.flag(&params).store(*checked, Relaxed);
+                                save_soon(cx);
+                                window.refresh();
+                            },
+                        )),
+                ),
+            )
+            .when(open, |d| d.child(self.stage_settings(stage, cx)))
+            .into_any_element()
+    }
+
+    /// "Start with Windows": one value in the current user's Run key (see `win.rs`).
+    fn startup_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = cx.global::<AppState>().autostart;
+        let hint = self
+            .autostart_error
+            .clone()
+            .unwrap_or_else(|| "Opens quietly in the tray when you sign in".into());
+        div()
+            .flex()
+            .items_center()
+            .gap(SP_12)
+            .py(SP_12)
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child("Start with Windows")
+                    .child(caption(hint)),
+            )
+            .child(
+                div()
+                    .cursor_pointer()
+                    .child(Switch::new("autostart").checked(on).on_click(cx.listener(
+                        |this, checked: &bool, _, cx| {
+                            match super::win::set_autostart(*checked) {
+                                Ok(()) => {
+                                    this.autostart_error = None;
+                                    let st = cx.global_mut::<AppState>();
+                                    st.autostart = *checked;
+                                    st.settings.start_with_windows = *checked;
+                                    save_soon(cx);
+                                }
+                                Err(e) => this.autostart_error = Some(e),
+                            }
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .into_any_element()
+    }
+
+    /// The fine settings under an open row.
+    fn stage_settings(&self, stage: Stage, cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.params;
+        let body = div().flex().flex_col().gap(SP_12).pt(SP_12);
+        match stage {
+            Stage::Gate => body
+                .child(value_slider(
+                    &self.gate,
+                    self.value_cell(Field::Gate, db(p.gate_threshold_db()), true, cx),
+                ))
+                .child(caption(
+                    "Higher cuts more between words; lower lets quiet speech through. \
+                     The mark on the Mic meter shows where it opens.",
+                )),
+            Stage::Agc => body
+                .child(value_slider(
+                    &self.agc,
+                    self.value_cell(Field::Agc, db_signed(p.agc_max_db()), true, cx),
+                ))
+                .child(caption("The most a quiet voice may be raised.")),
+            Stage::Eq => {
+                let preset = p.eq_preset();
+                let mut presets: Vec<EqPreset> = EqPreset::NAMED.to_vec();
+                presets.push(EqPreset::Custom);
+                body.child(segmented(
+                    presets.into_iter().map(|pr| {
+                        let params = Arc::clone(p);
+                        (
+                            SharedString::from(format!("eq-{}", pr.name())),
+                            pr.label(),
+                            pr == preset,
+                            Box::new(move |cx: &mut App| {
+                                if pr == EqPreset::Custom {
+                                    let gains = cx.global::<AppState>().settings.eq_custom;
+                                    params.set_eq_custom(gains);
+                                } else {
+                                    params.set_eq_preset(pr);
+                                }
+                                save_soon(cx);
+                                cx.refresh_windows();
+                            }) as Box<dyn Fn(&mut App)>,
+                        )
+                    }),
+                    CAPTION,
+                    28.0,
+                ))
+                .when(preset == EqPreset::Custom, |d| {
+                    let gains = p.eq_gains();
+                    d.children((0..3).map(|i| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(SP_12)
+                            .child(
+                                div()
+                                    .w(px(64.0))
+                                    .text_size(px(LABEL))
+                                    .text_color(c(TEXT_SECONDARY))
+                                    .child(EQ_BANDS[i]),
+                            )
+                            .child(slider_box(&self.eq[i], true))
+                            .child(self.value_cell(Field::Eq(i), db_signed(gains[i]), true, cx))
+                    }))
+                })
+                .child(caption(
+                    "Natural leaves your voice as it is. Custom: ±6 dB per band.",
+                ))
+            }
+            Stage::Hpf | Stage::Limiter => body,
+        }
+        .into_any_element()
+    }
+}
+
+/// A slider in a box that shows the hand cursor while it can be used.
+fn slider_box(s: &Entity<SliderState>, enabled: bool) -> impl IntoElement {
+    div()
+        .flex_1()
+        .when(enabled, |d| d.cursor_pointer())
+        .child(Slider::new(s).disabled(!enabled))
+}
+
+/// Width of the value column beside sliders (fits "−80 dB" and the text box).
+const VALUE_W: f32 = 64.0;
+
+fn value_slider(s: &Entity<SliderState>, value: AnyElement) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(SP_12)
+        .child(slider_box(s, true))
+        .child(value)
+}
+
+/// A segmented control: equal segments on a `bg` track, the selected one `accent`.
+fn segmented(
+    items: impl Iterator<Item = (SharedString, &'static str, bool, Box<dyn Fn(&mut App)>)>,
+    text: f32,
+    height: f32,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(SP_4)
+        .p(SP_4)
+        .bg(c(BG))
+        .rounded(RADIUS_CONTROL)
+        .children(items.map(move |(id, title, selected, on_pick)| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(height))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(RADIUS_CONTROL)
+                .text_size(px(text))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .map(|d| {
+                    if selected {
+                        d.bg(c(ACCENT)).text_color(c(BG))
+                    } else {
+                        d.text_color(c(TEXT_SECONDARY))
+                            .hover(|s| s.bg(c(ELEVATED)).text_color(c(TEXT_PRIMARY)))
+                    }
+                })
+                .on_click(move |_: &ClickEvent, _, cx| on_pick(cx))
+                .child(title)
+        }))
 }
 
 /// A panel on `surface` with a small label on top.
-fn card(title: &'static str) -> gpui::Div {
+fn card(title: &'static str) -> Div {
     div()
         .flex()
         .flex_col()
@@ -354,7 +915,7 @@ fn card(title: &'static str) -> gpui::Div {
 }
 
 /// A panel of rows separated by hairlines (no label).
-fn list_card(rows: Vec<gpui::AnyElement>) -> impl IntoElement {
+fn list_card(rows: Vec<AnyElement>) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -377,8 +938,9 @@ fn caption(text: impl Into<SharedString>) -> impl IntoElement {
 }
 
 /// One level meter: `accent` body, `meter_peak` only in the top 10% and for the
-/// peak-hold tick, on an `elevated` track.
-fn meter(label: &'static str, m: Meter, live: bool) -> impl IntoElement {
+/// peak-hold tick, on an `elevated` track. `mark` is an optional thin `text_secondary`
+/// line (the gate threshold on the Mic meter).
+fn level_meter(label: &'static str, m: Meter, live: bool, mark: Option<f32>) -> impl IntoElement {
     const HOT: f32 = 0.9;
     let (level, peak) = if live { (m.level, m.peak) } else { (0.0, 0.0) };
     div()
@@ -412,6 +974,17 @@ fn meter(label: &'static str, m: Meter, live: bool) -> impl IntoElement {
                                 .bg(c(METER_PEAK)),
                         ),
                 )
+                .when_some(mark, |d, at| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .w(px(1.0))
+                            .left(relative(at))
+                            .bg(c(TEXT_SECONDARY)),
+                    )
+                })
                 .when(peak > 0.01, |d| {
                     d.child(
                         div()
@@ -426,49 +999,8 @@ fn meter(label: &'static str, m: Meter, live: bool) -> impl IntoElement {
         )
 }
 
-/// Which `Params` switch a stage row drives.
-type Flag = fn(&Params) -> &AtomicBool;
-
-fn stage_row(
-    id: &'static str,
-    label: &'static str,
-    hint: String,
-    flag: Flag,
-    params: &Arc<Params>,
-) -> gpui::AnyElement {
-    let on = flag(params).load(Relaxed);
-    let p = Arc::clone(params);
-    div()
-        .flex()
-        .items_center()
-        .gap(SP_12)
-        .py(SP_12)
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .child(label)
-                .child(caption(hint)),
-        )
-        .child(
-            div()
-                .cursor_pointer()
-                .child(
-                    Switch::new(id)
-                        .checked(on)
-                        .on_click(move |checked: &bool, window, _| {
-                            // Read by the audio thread on its next frame; no lock, no message.
-                            flag(&p).store(*checked, Relaxed);
-                            window.refresh();
-                        }),
-                ),
-        )
-        .into_any_element()
-}
-
 /// Calm warning card: 2px `warning` rule on the left, text in `text_primary`.
-fn warning_card(what: impl Into<SharedString>, fix: impl Into<SharedString>) -> gpui::Div {
+fn warning_card(what: impl Into<SharedString>, fix: impl Into<SharedString>) -> Div {
     div()
         .flex()
         .flex_col()
@@ -537,7 +1069,7 @@ impl Render for MainWindow {
         self.sync_pickers(&st, window, cx);
         let running = st.state == State::Running;
 
-        let mut warnings: Vec<gpui::AnyElement> = Vec::new();
+        let mut warnings: Vec<AnyElement> = Vec::new();
         if st.cable_missing {
             warnings.push(
                 warning_card(
@@ -589,45 +1121,15 @@ impl Render for MainWindow {
         let latency = st
             .latency_ms
             .map_or("—".to_string(), |ms| format!("{ms:.0} ms"));
-        let p = &self.params;
-        let chain = vec![
-            stage_row(
-                "hpf",
-                "Low-cut filter",
-                "Removes rumble below 80 Hz".into(),
-                |p| &p.hpf,
-                p,
-            ),
-            stage_row(
-                "eq",
-                "Voice EQ",
-                p.eq_preset().label().to_string(),
-                |p| &p.eq,
-                p,
-            ),
-            stage_row(
-                "gate",
-                "Noise gate",
-                // A real minus sign (U+2212), not a hyphen.
-                format!("Opens at {:.0} dB", p.gate_threshold_db()).replace('-', "\u{2212}"),
-                |p| &p.gate,
-                p,
-            ),
-            stage_row(
-                "agc",
-                "Auto gain",
-                format!("Up to +{:.0} dB", p.agc_max_db()),
-                |p| &p.agc,
-                p,
-            ),
-            stage_row(
-                "limiter",
-                "Limiter",
-                "Stops sudden peaks".into(),
-                |p| &p.limiter,
-                p,
-            ),
-        ];
+        // Where the gate opens, on the Mic meter (only if the gate is on and the
+        // threshold is inside the meter's −60…0 dB scale).
+        let gate_mark = (self.params.gate.load(Relaxed) && running)
+            .then(|| meter::position(10f32.powf(self.params.gate_threshold_db() / 20.0)))
+            .filter(|&x| x > 0.0);
+        let chain: Vec<AnyElement> = Stage::ALL
+            .into_iter()
+            .map(|s| self.stage_row(s, cx))
+            .collect();
         let devices = vec![
             self.device_row(
                 assets::MIC,
@@ -680,11 +1182,12 @@ impl Render for MainWindow {
                     .child(
                         card("Levels")
                             .gap(SP_12)
-                            .child(meter("Mic", self.meter_in, running))
-                            .child(meter("Output", self.meter_out, running)),
+                            .child(level_meter("Mic", self.meter_in, running, gate_mark))
+                            .child(level_meter("Output", self.meter_out, running, None)),
                     )
                     .child(list_card(devices))
                     .child(list_card(chain))
+                    .child(list_card(vec![self.startup_row(cx)]))
                     .child(
                         div()
                             .flex()
@@ -698,5 +1201,31 @@ impl Render for MainWindow {
                             .child(readout("Memory", format!("{:.0} MB", self.private_mb))),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decibel_text_uses_a_real_minus_sign() {
+        assert_eq!(db(-45.0), "\u{2212}45 dB");
+        assert_eq!(db_signed(12.0), "+12 dB");
+        assert_eq!(db_signed(-1.5), "\u{2212}1.5 dB");
+        assert_eq!(db_signed(0.0), "0 dB");
+        assert_eq!(db_signed(-0.0), "0 dB");
+    }
+
+    #[test]
+    fn typed_numbers_are_read_leniently() {
+        assert_eq!(parse_number("-45"), Some(-45.0));
+        assert_eq!(parse_number("\u{2212}45 dB"), Some(-45.0));
+        assert_eq!(parse_number(" +12 dB "), Some(12.0));
+        assert_eq!(parse_number("80%"), Some(80.0));
+        assert_eq!(parse_number("3.5"), Some(3.5));
+        assert_eq!(parse_number("loud"), None);
+        assert_eq!(parse_number(""), None);
+        assert_eq!(parse_number("inf"), None);
     }
 }

@@ -29,6 +29,7 @@ use cpal::DeviceId;
 use sotto::control::{Change, Chosen, Controller, EngineKind};
 use sotto::devices::{self, Dir};
 use sotto::params::Params;
+use sotto::settings::SavedDevice;
 use sotto::stats::Stats;
 
 #[derive(Clone, Default, PartialEq)]
@@ -86,6 +87,8 @@ pub struct Status {
 
 pub enum Command {
     SetEngine(EngineKind),
+    /// DeepFilterNet's post-filter; reloads the model if it is running (~0.5 s).
+    SetPostFilter(bool),
     /// Choose the device with this endpoint ID (as text).
     Select(Dir, String),
     /// Re-read the device lists now (e.g. the window was just shown).
@@ -101,11 +104,23 @@ pub struct Audio {
     pub params: Arc<Params>,
 }
 
-/// What to open at start, from the command line (saved settings come in 3c).
+/// What to open at start: devices saved last time, unless the command line names others.
 pub struct Choice {
+    /// `--input` / `--output`: part of a device name (for testing and measurements).
     pub input: Option<String>,
     pub output: Option<String>,
+    pub saved_input: Option<SavedDevice>,
+    pub saved_output: Option<SavedDevice>,
     pub engine: EngineKind,
+    /// A problem with the settings file, to show once.
+    pub note: Option<String>,
+}
+
+/// A slow change being retried while a previous switch finishes.
+#[derive(Clone, Copy)]
+enum Want {
+    Engine(EngineKind),
+    PostFilter(bool),
 }
 
 /// While the window is visible, how often device lists and the "CABLE is default"
@@ -116,9 +131,9 @@ const TICK_EVERY: Duration = Duration::from_secs(1);
 const RETRY_EVERY: Duration = Duration::from_millis(100);
 
 impl Audio {
-    pub fn spawn(choice: Choice, visible: Arc<AtomicBool>) -> Self {
+    /// `params` already holds the saved settings.
+    pub fn spawn(choice: Choice, params: Arc<Params>, visible: Arc<AtomicBool>) -> Self {
         let status = Arc::new(Mutex::new(Status::default()));
-        let params = Arc::new(Params::new());
         let (tx, rx) = mpsc::channel();
         let (st, p) = (Arc::clone(&status), Arc::clone(&params));
         let thread = thread::Builder::new()
@@ -163,9 +178,11 @@ fn set(status: &Mutex<Status>, f: impl FnOnce(&mut Status)) {
     }
 }
 
-/// Apply the command-line choice. The mic is never guessed: without `--input` the user
-/// picks it in the window. The output defaults to the standard "CABLE Input" endpoint
-/// (VB-Cable only — `find_output` never returns anything else).
+/// Pick the starting devices. The mic is never guessed: it is the one named on the
+/// command line, or the one saved last time (waited for if it's unplugged), or none
+/// until the user picks it. The output is the one named, or the saved one, or else the
+/// standard "CABLE Input" endpoint (VB-Cable only — `find_output` never returns anything
+/// else).
 fn initial_devices(ctl: &mut Controller, choice: &Choice) -> Option<String> {
     let mut err = None;
     let host = cpal::default_host();
@@ -173,6 +190,19 @@ fn initial_devices(ctl: &mut Controller, choice: &Choice) -> Option<String> {
         match devices::find_input(&host, q) {
             Ok(m) => err = ctl.select(Dir::Input, &m.id).err(),
             Err(e) => err = Some(e),
+        }
+    } else if let Some(d) = &choice.saved_input
+        && let Err(e) = ctl.restore(Dir::Input, &d.id, &d.name)
+    {
+        err = Some(e);
+    }
+    if choice.output.is_none()
+        && let Some(d) = &choice.saved_output
+    {
+        if let Err(e) = ctl.restore(Dir::Output, &d.id, &d.name) {
+            err = Some(e);
+        } else {
+            return err;
         }
     }
     if let Ok(c) = devices::find_output(&host, choice.output.as_deref())
@@ -208,11 +238,11 @@ fn control_loop(
     set(status, |s| {
         s.stats = Some(Arc::clone(&ctl.stats));
         s.engine = Some(ctl.engine_kind());
-        s.message = first_err;
+        s.message = first_err.or(choice.note.clone());
     });
 
     let mut waiting_note = String::new();
-    let mut pending_engine: Option<EngineKind> = None;
+    let mut pending: Option<Want> = None;
     let mut next_tick = Instant::now();
     let mut next_list = Instant::now();
     loop {
@@ -234,17 +264,20 @@ fn control_loop(
             next_list = now + LIST_EVERY;
             refresh_lists(&ctl, status);
         }
-        if let Some(kind) = pending_engine {
-            pending_engine = switch_engine(&mut ctl, kind, status);
+        if let Some(want) = pending {
+            pending = change(&mut ctl, want, status);
         }
 
-        let wait = if pending_engine.is_some() {
+        let wait = if pending.is_some() {
             RETRY_EVERY
         } else {
             next_tick.saturating_duration_since(Instant::now())
         };
         match rx.recv_timeout(wait) {
-            Ok(Command::SetEngine(kind)) => pending_engine = switch_engine(&mut ctl, kind, status),
+            Ok(Command::SetEngine(kind)) => pending = change(&mut ctl, Want::Engine(kind), status),
+            Ok(Command::SetPostFilter(on)) => {
+                pending = change(&mut ctl, Want::PostFilter(on), status)
+            }
             Ok(Command::Select(dir, id)) => {
                 let r = select(&mut ctl, dir, &id);
                 set(status, |s| s.message = r.err());
@@ -263,18 +296,25 @@ fn control_loop(
     ctl.stop();
 }
 
-/// Ask for `kind`. Returns `Some(kind)` to retry shortly if a switch is still finishing.
-fn switch_engine(
-    ctl: &mut Controller,
-    kind: EngineKind,
-    status: &Mutex<Status>,
-) -> Option<EngineKind> {
+/// Make a slow change (engine switch, or post-filter = DeepFilterNet reload). Returns
+/// `Some` to retry shortly if a previous switch is still finishing.
+fn change(ctl: &mut Controller, want: Want, status: &Mutex<Status>) -> Option<Want> {
+    let loading = match want {
+        Want::Engine(kind) => Some(kind),
+        // Only a running DeepFilterNet needs reloading; otherwise it's just stored.
+        Want::PostFilter(_) => (ctl.engine_kind() == EngineKind::Dfn).then_some(EngineKind::Dfn),
+    };
     set(status, |s| {
-        s.loading = Some(kind);
-        s.engine = Some(kind);
+        if let Some(kind) = loading {
+            s.loading = Some(kind);
+            s.engine = Some(kind);
+        }
     });
-    // DeepFilterNet loads inside this call (~0.5 s); the window keeps drawing meanwhile.
-    let r = ctl.set_engine(kind);
+    // DeepFilterNet loads inside these calls (~0.5 s); the window keeps drawing meanwhile.
+    let r = match want {
+        Want::Engine(kind) => ctl.set_engine(kind),
+        Want::PostFilter(on) => ctl.set_postfilter(on),
+    };
     let _ = ctl.take_notes();
     let retry = matches!(r, Ok(Change::Busy));
     set(status, |s| {
@@ -282,9 +322,12 @@ fn switch_engine(
             s.loading = None;
             s.engine = Some(ctl.engine_kind());
         }
-        s.message = r.err().map(|e| format!("Could not switch engine: {e}"));
+        s.message = r.err().map(|e| match want {
+            Want::Engine(_) => format!("Could not switch engine: {e}"),
+            Want::PostFilter(_) => format!("Could not change the post-filter: {e}"),
+        });
     });
-    retry.then_some(kind)
+    retry.then_some(want)
 }
 
 fn publish(ctl: &Controller, status: &Mutex<Status>, waiting_note: &mut String) {

@@ -73,34 +73,15 @@ pub fn build(cx: &mut App, on_action: fn(Action, &mut App)) -> Result<TrayIcon, 
         .map_err(|e| e.to_string())
 }
 
-/// Placeholder tray glyph drawn in code (the real mark comes with branding): a wave
-/// that calms into a flat line, light on transparent, 32×32.
+/// The Sotto mark as a monochrome glyph: light on a dark taskbar, dark on a light one
+/// (read once at start; the spec's `text_primary` colours for each theme).
 fn icon() -> Result<Icon, String> {
-    const N: usize = 32;
-    let wave = |x: f32| {
-        let amp = (8.0 * (1.0 - x / 20.0)).max(0.0);
-        16.0 - amp * (std::f32::consts::TAU * (x - 3.0) / 10.0).sin()
+    const N: u32 = 32;
+    let ink = if super::win::taskbar_is_light() {
+        [0x2B, 0x29, 0x25]
+    } else {
+        [0xE8, 0xE4, 0xDC]
     };
-    let mut rgba = vec![0u8; N * N * 4];
-    for py in 0..N {
-        for px in 0..N {
-            let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
-            if !(3.0..=29.0).contains(&fx) {
-                continue;
-            }
-            // Distance to the curve, sampled finely around this column.
-            let mut d = f32::MAX;
-            let mut t = fx - 3.0;
-            while t <= fx + 3.0 {
-                if (3.0..=29.0).contains(&t) {
-                    d = d.min(((t - fx).powi(2) + (wave(t) - fy).powi(2)).sqrt());
-                }
-                t += 0.1;
-            }
-            let alpha = (1.0 - (d - 1.1).max(0.0)).clamp(0.0, 1.0);
-            let i = (py * N + px) * 4;
-            rgba[i..i + 4].copy_from_slice(&[0xE8, 0xE4, 0xDC, (alpha * 255.0) as u8]);
-        }
-    }
-    Icon::from_rgba(rgba, N as u32, N as u32).map_err(|e| e.to_string())
+    let rgba = super::mark::render(N, super::mark::Style::Tray(ink));
+    Icon::from_rgba(rgba, N, N).map_err(|e| e.to_string())
 }

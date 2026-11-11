@@ -8,27 +8,39 @@
 //! - While hidden: Windows never asks a hidden window to paint, and our once-a-second
 //!   refresh skips its redraw, so nothing is drawn and the GPU stays idle.
 //! - Only "Quit Sotto" in the tray ends the program.
+//!
+//! Settings: loaded from `%APPDATA%\Sotto\settings.toml` before the audio starts, and
+//! saved half a second after the last change (and once more on quit).
 
 mod assets;
 mod audio;
 mod main_window;
+mod mark;
 mod meter;
 mod theme;
 mod tray;
 mod win;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Application, Bounds, Global, TitlebarOptions, WindowBounds, WindowHandle,
-    WindowOptions, px, size,
+    App, AppContext, Application, Bounds, Global, Task, TitlebarOptions, WindowBounds,
+    WindowHandle, WindowOptions, px, size,
 };
 use gpui_component::Root;
 use sotto::control::EngineKind;
+use sotto::params::Params;
+use sotto::settings::{self, SavedDevice, Settings};
 
 use audio::{Audio, Choice};
 use main_window::MainWindow;
+
+/// Wait this long after the last change before writing the settings file, so dragging
+/// a slider writes once, not sixty times a second.
+const SAVE_AFTER: Duration = Duration::from_millis(500);
 
 struct AppState {
     audio: Audio,
@@ -38,52 +50,121 @@ struct AppState {
     /// Shared with the window: false while hidden, so it skips redraws.
     visible: Arc<AtomicBool>,
     tray: Option<tray_icon::TrayIcon>,
+    settings: Settings,
+    /// What is on disk now, to skip writing an unchanged file.
+    saved: Settings,
+    settings_path: Option<PathBuf>,
+    /// The pending delayed save; replacing it cancels the previous one.
+    save_task: Option<Task<()>>,
+    /// Whether Sotto's "Start with Windows" entry exists (the registry is the truth).
+    autostart: bool,
 }
 
 impl Global for AppState {}
 
-/// `sotto.exe [--input NAME] [--output NAME] [--engine rnnoise|dfn|off]`
-fn parse_args() -> Choice {
-    let mut choice = Choice {
+struct Args {
+    input: Option<String>,
+    output: Option<String>,
+    engine: Option<EngineKind>,
+    /// Start in the tray without showing the window (used by "Start with Windows").
+    hidden: bool,
+}
+
+/// `sotto.exe [--input NAME] [--output NAME] [--engine rnnoise|dfn|off] [--hidden]`
+fn parse_args() -> Args {
+    let mut a = Args {
         input: None,
         output: None,
-        engine: EngineKind::Rnnoise,
+        engine: None,
+        hidden: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
-            "--input" => choice.input = it.next(),
-            "--output" => choice.output = it.next(),
-            "--engine" => {
-                if let Some(k) = it.next().as_deref().and_then(EngineKind::parse) {
-                    choice.engine = k;
-                }
-            }
+            "--input" => a.input = it.next(),
+            "--output" => a.output = it.next(),
+            "--engine" => a.engine = it.next().as_deref().and_then(EngineKind::parse),
+            "--hidden" => a.hidden = true,
             _ => {}
         }
     }
-    choice
+    a
 }
 
 pub fn run() {
-    let choice = parse_args();
+    // Only one Sotto: a second copy brings the first one's window up and leaves.
+    // `_claim` marks us as running until `run` returns (the app has quit).
+    let (_claim, show_signal) = match win::claim_instance() {
+        win::Instance::Second => return,
+        win::Instance::First(claim, signal) => (claim, signal),
+    };
+    let args = parse_args();
+    let settings_path = settings::default_path();
+    let loaded = settings_path
+        .as_deref()
+        .map(settings::load)
+        .unwrap_or(settings::Loaded {
+            settings: Settings::default(),
+            note: None,
+        });
+    let mut s = loaded.settings;
+    win::refresh_autostart();
+    let autostart = win::autostart_enabled();
+    s.start_with_windows = autostart;
+    let params = Arc::new(Params::new());
+    s.apply(&params);
+    let choice = Choice {
+        input: args.input,
+        output: args.output,
+        saved_input: s.input.clone(),
+        saved_output: s.output.clone(),
+        engine: args.engine.unwrap_or(s.engine()),
+        note: loaded.note,
+    };
+    let hidden = args.hidden;
+
     Application::new()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             theme::apply(cx);
 
-            let visible = Arc::new(AtomicBool::new(true));
-            let audio = Audio::spawn(choice, Arc::clone(&visible));
+            let visible = Arc::new(AtomicBool::new(!hidden));
+            let audio = Audio::spawn(choice, params, Arc::clone(&visible));
             let tray = tray::build(cx, on_tray).ok();
+            // Without a tray there would be no way to open a hidden window.
+            let show = !hidden || tray.is_none();
             cx.set_global(AppState {
                 audio,
                 main: None,
                 main_id: None,
                 visible,
                 tray,
+                saved: s.clone(),
+                settings: s,
+                settings_path,
+                save_task: None,
+                autostart,
             });
-            open_main(cx);
+            if show {
+                open_main(cx);
+            }
+            // Wait (off the UI thread, in the kernel: no CPU) for a second copy to ask
+            // us to show the window.
+            if let Some(signal) = show_signal {
+                cx.spawn(async move |cx| {
+                    loop {
+                        let asked = cx
+                            .background_executor()
+                            .spawn(async move { signal.wait() })
+                            .await;
+                        if !asked || cx.update(open_main).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
         });
 }
 
@@ -91,10 +172,53 @@ fn on_tray(action: tray::Action, cx: &mut App) {
     match action {
         tray::Action::Open => open_main(cx),
         tray::Action::Quit => {
+            save_now(cx);
             // Stop streams and the engine cleanly before the program ends.
             cx.global_mut::<AppState>().audio.stop();
             cx.quit();
         }
+    }
+}
+
+/// Something the user can change was changed: save shortly.
+fn save_soon(cx: &mut App) {
+    let task = cx.spawn(async move |cx| {
+        cx.background_executor().timer(SAVE_AFTER).await;
+        let _ = cx.update(save_now);
+    });
+    cx.global_mut::<AppState>().save_task = Some(task);
+}
+
+/// Gather the current choices and write them if anything changed. The file is a few
+/// hundred bytes, so this is quick enough for the UI thread.
+fn save_now(cx: &mut App) {
+    let st = cx.global_mut::<AppState>();
+    st.save_task = None;
+    st.settings.read_params(&st.audio.params);
+    if let Ok(s) = st.audio.status.lock() {
+        let saved = |d: &audio::Device| SavedDevice {
+            id: d.id.clone(),
+            name: d.name.clone(),
+        };
+        // Keep a remembered device even while it's unplugged (the status still holds
+        // it then); only a real choice replaces it.
+        if let Some(d) = &s.input {
+            st.settings.input = Some(saved(d));
+        }
+        if let Some(d) = &s.output {
+            st.settings.output = Some(saved(d));
+        }
+        if let Some(e) = s.engine {
+            st.settings.engine = e.name().into();
+        }
+    }
+    if st.settings == st.saved {
+        return;
+    }
+    if let Some(path) = &st.settings_path
+        && settings::save(path, &st.settings).is_ok()
+    {
+        st.saved = st.settings.clone();
     }
 }
 
@@ -117,6 +241,8 @@ fn open_main(cx: &mut App) {
     let params = st.audio.params.clone();
     let visible = st.visible.clone();
     visible.store(true, Relaxed);
+    // Lists are only refreshed while visible; this window may be the first one.
+    st.audio.send(audio::Command::Refresh);
     // Without a tray there would be no way back, so then closing really closes (and,
     // being the last window, ends the program).
     let hide_on_close = st.tray.is_some();

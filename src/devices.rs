@@ -137,15 +137,36 @@ pub fn find_output(host: &Host, query: Option<&str>) -> Result<Named, String> {
     })
 }
 
-/// Reconnect path: find the device with exactly this endpoint ID — nothing fuzzy.
-pub fn find_by_id(host: &Host, dir: Dir, id: &DeviceId, name: &str) -> Result<Device, String> {
-    let found = list(host, dir)?.into_iter().find(|d| &d.id == id);
-    match (found, dir) {
-        (Some(d), Dir::Output) if !is_vb_cable(&d.name) => {
-            Err(format!("\"{}\" is no longer a VB-Cable device", d.name))
-        }
-        (Some(d), _) => Ok(d.device),
-        (None, _) => Err(format!("\"{name}\" is not connected")),
+/// Find the device the user chose, among what may be chosen for `dir` (so an output is
+/// always a VB-Cable endpoint): by its exact endpoint ID, or — if Windows gave it a new
+/// ID, e.g. after moving the mic to another USB port — by its exact full name. Never a
+/// partial name, never some other device.
+pub fn find_chosen(host: &Host, dir: Dir, id: &DeviceId, name: &str) -> Result<Named, String> {
+    let mut found = choices(host, dir)?;
+    let keys: Vec<(String, &str)> = found
+        .iter()
+        .map(|d| (d.id.to_string(), d.name.as_str()))
+        .collect();
+    match pick_saved(&keys, &id.to_string(), name) {
+        Some(i) => Ok(found.swap_remove(i)),
+        None => Err(format!("\"{name}\" is not connected")),
+    }
+}
+
+/// The matching rule of `find_chosen`, on plain `(id, name)` pairs so it can be tested
+/// without audio hardware. A name match counts only if exactly one device has that
+/// full name (two identical names would be a guess).
+pub fn pick_saved(devices: &[(String, &str)], id: &str, name: &str) -> Option<usize> {
+    if let Some(i) = devices.iter().position(|(d, _)| d == id) {
+        return Some(i);
+    }
+    let mut same_name = devices
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, n))| !name.is_empty() && *n == name);
+    match (same_name.next(), same_name.next()) {
+        (Some((i, _)), None) => Some(i),
+        _ => None,
     }
 }
 
@@ -200,5 +221,65 @@ mod tests {
             "VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)"
         ));
         assert!(!is_vb_cable("Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)"));
+    }
+
+    fn devs(list: &[(&str, &'static str)]) -> Vec<(String, &'static str)> {
+        list.iter().map(|(i, n)| (i.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn saved_device_matches_by_id_first() {
+        let d = devs(&[
+            ("id-a", "Microphone (fifine Microphone)"),
+            ("id-b", "Line (DAC)"),
+        ]);
+        assert_eq!(
+            pick_saved(&d, "id-b", "Microphone (fifine Microphone)"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn saved_device_falls_back_only_to_the_exact_full_name() {
+        let d = devs(&[
+            ("id-new", "Microphone (fifine Microphone)"),
+            ("id-x", "Line (DAC)"),
+        ]);
+        // New ID after a USB port change: same full name → found.
+        assert_eq!(
+            pick_saved(&d, "id-old", "Microphone (fifine Microphone)"),
+            Some(0)
+        );
+        // Partial or different names never match.
+        assert_eq!(pick_saved(&d, "id-old", "fifine"), None);
+        assert_eq!(
+            pick_saved(&d, "id-old", "Microphone (fifine Microphone) "),
+            None
+        );
+        assert_eq!(pick_saved(&d, "id-old", ""), None);
+    }
+
+    #[test]
+    fn missing_device_is_never_replaced() {
+        let d = devs(&[("id-x", "Line (DAC)"), ("id-y", "Microphone (Webcam)")]);
+        assert_eq!(
+            pick_saved(&d, "id-gone", "Microphone (fifine Microphone)"),
+            None
+        );
+        assert_eq!(
+            pick_saved(&[], "id-gone", "Microphone (fifine Microphone)"),
+            None
+        );
+    }
+
+    #[test]
+    fn two_devices_with_the_same_name_are_not_guessed() {
+        let d = devs(&[
+            ("id-1", "Microphone (USB Audio)"),
+            ("id-2", "Microphone (USB Audio)"),
+        ]);
+        assert_eq!(pick_saved(&d, "id-gone", "Microphone (USB Audio)"), None);
+        // ...but the exact ID still picks the right one.
+        assert_eq!(pick_saved(&d, "id-2", "Microphone (USB Audio)"), Some(1));
     }
 }

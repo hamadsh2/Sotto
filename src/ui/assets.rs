@@ -16,14 +16,20 @@ use gpui::{AssetSource, Result, SharedString};
 pub const MARK: &str = "icon/sotto-mark.svg";
 pub const MIC: &str = "icons/mic.svg";
 pub const PLUG: &str = "icons/plug.svg";
+pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
+pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
 
 const FILES: &[(&str, &[u8])] = &[
     (MARK, include_bytes!("../../assets/icon/sotto-mark.svg")),
     (MIC, include_bytes!("../../assets/icons/mic.svg")),
     (PLUG, include_bytes!("../../assets/icons/plug.svg")),
+    (
+        CHEVRON_RIGHT,
+        include_bytes!("../../assets/icons/chevron-right.svg"),
+    ),
     // Used by gpui-component itself (dropdown arrow, selected item).
     (
-        "icons/chevron-down.svg",
+        CHEVRON_DOWN,
         include_bytes!("../../assets/icons/chevron-down.svg"),
     ),
     (
