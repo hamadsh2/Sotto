@@ -17,6 +17,7 @@
 
 mod assets;
 mod audio;
+mod health;
 mod hotkey;
 mod licenses;
 mod main_window;

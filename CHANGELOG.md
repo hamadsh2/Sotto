@@ -2,6 +2,17 @@
 
 All notable changes to Sotto. Versions follow [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- **Tune for my room:** a 10-second check (5 s quiet, 5 s talking) that suggests a noise-gate
+  threshold and auto-gain limit for your mic and room. Nothing changes until you click Apply.
+- Calm hints when your microphone is set too loud (it clips) or your voice stays very quiet.
+- `sotto-cli`: `tune` and `tune apply` commands.
+
+### Changed
+- Auto gain aims for a slightly quieter level (−23 dB instead of −20 dB).
+
 ## [0.1.0] - 2026-11-11
 
 The first release.

@@ -15,6 +15,20 @@ const BUCKET_NS: u64 = 2_000; // 2 µs
 /// 5000 buckets × 2 µs = 10 ms (one full frame period). Slower frames go in the last bucket.
 const BUCKETS: usize = 5_000;
 
+/// Level histograms for "Tune for my room": 1 dB bins from −100 dB (bin 0, also
+/// everything quieter) to 0 dB (bin 99, also anything louder).
+pub const TUNE_BINS: usize = 100;
+/// A raw mic sample at or above this counts as clipping (−0.09 dBFS).
+pub const CLIP_LEVEL: f32 = 0.99;
+
+/// The histogram bin for a level in dB (NaN counts as silence).
+pub fn tune_bin(db: f32) -> usize {
+    if db.is_nan() {
+        return 0;
+    }
+    (db + 100.0).floor().clamp(0.0, (TUNE_BINS - 1) as f32) as usize
+}
+
 pub struct Stats {
     /// Per-frame processing-time histogram (audio thread writes, main thread reads+resets).
     hist: Box<[AtomicU32]>,
@@ -55,6 +69,21 @@ pub struct Stats {
     /// as f32 bits (for the level meters).
     level_in: AtomicU32,
     level_out: AtomicU32,
+    /// Frames whose raw mic peak reached `CLIP_LEVEL` (mic level too high).
+    pub clip_frames: AtomicU64,
+    /// Frames that were mostly speech (above the gate threshold).
+    pub speech_frames: AtomicU64,
+    /// The auto gain's measured voice level before its gain, dB, as f32 bits.
+    pub voice_db: AtomicU32,
+    /// "Tune for my room" is measuring: the worker fills the histograms below.
+    tuning: AtomicBool,
+    /// While tuning, frames whose gate-detector level is at least this (dB, f32 bits)
+    /// count as voice.
+    tune_voice_min_db: AtomicU32,
+    /// Gate-detector level of every frame while tuning.
+    tune_level: Box<[AtomicU32]>,
+    /// RMS of the frames that count as voice while tuning.
+    tune_voice: Box<[AtomicU32]>,
 }
 
 impl Default for Stats {
@@ -88,6 +117,13 @@ impl Stats {
             switch_done: AtomicU64::new(0),
             level_in: AtomicU32::new(0),
             level_out: AtomicU32::new(0),
+            clip_frames: AtomicU64::new(0),
+            speech_frames: AtomicU64::new(0),
+            voice_db: AtomicU32::new(crate::dsp::AGC_TARGET_DB.to_bits()),
+            tuning: AtomicBool::new(false),
+            tune_voice_min_db: AtomicU32::new(0f32.to_bits()),
+            tune_level: (0..TUNE_BINS).map(|_| AtomicU32::new(0)).collect(),
+            tune_voice: (0..TUNE_BINS).map(|_| AtomicU32::new(0)).collect(),
         }
     }
 
@@ -109,13 +145,51 @@ impl Stats {
         let cdb = (info.limit_db.clamp(0.0, 100.0) * 100.0) as u32;
         self.limit_cdb.fetch_max(cdb, Relaxed);
         self.engine_errors.store(info.engine_errors, Relaxed);
+        if info.speaking {
+            self.speech_frames.fetch_add(1, Relaxed);
+        }
+        self.voice_db.store(info.voice_db.to_bits(), Relaxed);
+        if self.tuning.load(Relaxed) {
+            self.tune_level[tune_bin(info.level_db)].fetch_add(1, Relaxed);
+            let min = f32::from_bits(self.tune_voice_min_db.load(Relaxed));
+            if info.level_db >= min {
+                self.tune_voice[tune_bin(info.rms_db)].fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// Main thread: start (or restart) a tuning measurement with empty histograms.
+    /// Frames at or above `voice_min_db` count as voice.
+    pub fn tune_begin(&self, voice_min_db: f32) {
+        self.tuning.store(false, Relaxed);
+        for b in self.tune_level.iter().chain(self.tune_voice.iter()) {
+            b.store(0, Relaxed);
+        }
+        self.tune_voice_min_db
+            .store(voice_min_db.to_bits(), Relaxed);
+        self.tuning.store(true, Relaxed);
+    }
+
+    /// Main thread: the histograms so far as (level, voice), and reset them. Measuring
+    /// goes on until `tune_end`.
+    pub fn tune_take(&self) -> ([u32; TUNE_BINS], [u32; TUNE_BINS]) {
+        let take = |h: &[AtomicU32]| std::array::from_fn(|i| h[i].swap(0, Relaxed));
+        (take(&self.tune_level), take(&self.tune_voice))
+    }
+
+    pub fn tune_end(&self) {
+        self.tuning.store(false, Relaxed);
     }
 
     /// Worker: remember the loudest sample of this frame's input and output, for the
     /// meters. Atomics only. For non-negative floats the bit patterns sort like the
     /// values, so an integer `fetch_max` keeps the larger level.
     pub fn record_levels(&self, input: &[f32], output: &[f32]) {
-        self.level_in.fetch_max(peak(input).to_bits(), Relaxed);
+        let p = peak(input);
+        if p >= CLIP_LEVEL {
+            self.clip_frames.fetch_add(1, Relaxed);
+        }
+        self.level_in.fetch_max(p.to_bits(), Relaxed);
         self.level_out.fetch_max(peak(output).to_bits(), Relaxed);
     }
 
@@ -326,6 +400,51 @@ pub fn process_memory() -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tune_histograms_fill_only_while_tuning() {
+        use crate::dsp::FrameInfo;
+        let s = Stats::new();
+        let frame = |level_db, rms_db| FrameInfo {
+            level_db,
+            rms_db,
+            ..Default::default()
+        };
+        s.record_chain(&frame(-60.0, -65.0)); // not tuning: ignored
+        s.tune_begin(-50.0);
+        s.record_chain(&frame(-60.0, -65.0)); // quiet: level only
+        s.record_chain(&frame(-30.0, -33.5)); // voice: both
+        s.record_chain(&frame(f32::NAN, -500.0));
+        let (level, voice) = s.tune_take();
+        assert_eq!(level[tune_bin(-60.0)], 1);
+        assert_eq!(level[tune_bin(-30.0)], 1);
+        assert_eq!(level[0], 1);
+        assert_eq!(level.iter().sum::<u32>(), 3);
+        assert_eq!(voice[tune_bin(-33.5)], 1);
+        assert_eq!(voice.iter().sum::<u32>(), 1);
+        s.tune_end();
+        s.record_chain(&frame(-30.0, -30.0));
+        assert_eq!(s.tune_take().0.iter().sum::<u32>(), 0);
+    }
+
+    #[test]
+    fn tune_bins_cover_minus_100_to_0_db() {
+        assert_eq!(tune_bin(-200.0), 0);
+        assert_eq!(tune_bin(-100.0), 0);
+        assert_eq!(tune_bin(-99.5), 0);
+        assert_eq!(tune_bin(-45.0), 55);
+        assert_eq!(tune_bin(-0.5), 99);
+        assert_eq!(tune_bin(6.0), 99);
+        assert_eq!(tune_bin(f32::NAN), 0);
+    }
+
+    #[test]
+    fn clipping_frames_are_counted() {
+        let s = Stats::new();
+        s.record_levels(&[0.5, -0.995], &[0.1]);
+        s.record_levels(&[0.9], &[0.1]);
+        assert_eq!(s.clip_frames.load(Relaxed), 1);
+    }
 
     #[test]
     fn levels_keep_the_loudest_and_reset_on_read() {

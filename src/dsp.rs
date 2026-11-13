@@ -182,6 +182,11 @@ impl Gate {
         self.open
     }
 
+    /// The detector level the threshold is compared with (linear, 0..).
+    pub fn level(&self) -> f32 {
+        self.env
+    }
+
     /// True while the level is at or above the threshold right now. Unlike `is_open`,
     /// this excludes the hold time and word tails, so the AGC measures only real speech.
     pub fn is_speaking(&self) -> bool {
@@ -233,8 +238,9 @@ impl Gate {
 // Auto gain: brings a quiet or loud voice toward a steady level.
 // ---------------------------------------------------------------------------
 
-/// Speech level the AGC aims for (RMS).
-const AGC_TARGET_DB: f32 = -20.0;
+/// Speech level the AGC aims for (RMS). Was −20; the user found that too loud on a
+/// real voice (Phase 5a test), so −23.
+pub const AGC_TARGET_DB: f32 = -23.0;
 const AGC_MIN_GAIN_DB: f32 = -12.0;
 /// Gain changes slowly so it never "pumps": +3 dB/s up, −12 dB/s down (per 10 ms frame).
 const AGC_UP_DB_PER_FRAME: f32 = 0.03;
@@ -272,6 +278,11 @@ impl Agc {
 
     pub fn gain_db(&self) -> f32 {
         self.gain_db
+    }
+
+    /// The voice level it has measured (smoothed RMS of speech, before its gain), dB.
+    pub fn level_db(&self) -> f32 {
+        10.0 * self.ms.max(1e-12).log10()
     }
 
     /// Update the gain from one frame. `voiced[i]` says whether sample i is speech
@@ -428,6 +439,15 @@ pub struct FrameInfo {
     pub limit_db: f32,
     /// Frames the current engine has failed to process so far (passed through).
     pub engine_errors: u64,
+    /// Highest gate-detector level in this frame, dB (what the threshold is compared
+    /// with: after denoise and EQ, before the gate).
+    pub level_db: f32,
+    /// RMS of this frame at the same point (after EQ, before the gate), dB.
+    pub rms_db: f32,
+    /// Most of this frame was speech (above the gate threshold).
+    pub speaking: bool,
+    /// The auto gain's measured voice level, before its gain, dB.
+    pub voice_db: f32,
 }
 
 /// A denoise engine plus the dry-path delay matched to its latency, so the strength
@@ -680,10 +700,14 @@ impl Chain {
         // 3. Gate (the detector always runs; the AGC uses it to tell speech from
         // silence).
         let mut any_open = false;
+        let (mut level, mut sum_sq, mut n_voiced) = (0.0f32, 0.0f32, 0usize);
         for (i, x) in self.b.iter_mut().enumerate() {
             let g = self.gate.process(*x);
             self.voiced[i] = self.gate.is_speaking();
             any_open |= self.gate.is_open();
+            level = level.max(self.gate.level());
+            sum_sq += *x * *x;
+            n_voiced += usize::from(self.voiced[i]);
             *x *= 1.0 + (g - 1.0) * self.gate_amt.next(gate_on);
         }
 
@@ -716,6 +740,10 @@ impl Chain {
             },
             limit_db: -lin_to_db(min_gain),
             engine_errors: self.engine.den.errors(),
+            level_db: lin_to_db(level),
+            rms_db: 10.0 * (sum_sq / FRAME as f32).max(1e-18).log10(),
+            speaking: n_voiced >= FRAME / 2,
+            voice_db: self.agc.level_db(),
         }
     }
 }

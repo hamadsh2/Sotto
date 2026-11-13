@@ -13,3 +13,4 @@ pub mod instance;
 pub mod params;
 pub mod settings;
 pub mod stats;
+pub mod tune;

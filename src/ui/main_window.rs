@@ -39,9 +39,11 @@ use sotto::params::{
     AGC_MAX_DB_MAX, AGC_MAX_DB_MIN, EQ_DB_LIMIT, EqPreset, GATE_DB_MAX, GATE_DB_MIN, Params,
 };
 use sotto::stats;
+use sotto::tune::{self, Failure, Phase, Suggestion};
 
 use super::assets;
 use super::audio::{Command, Device, State, Status};
+use super::health::{Health, Hints};
 use super::licenses::{self, License};
 use super::meter::{self, Meter};
 use super::theme::*;
@@ -217,6 +219,17 @@ pub struct MainWindow {
     shown: [(Vec<Device>, Option<String>); 2],
     /// The stage whose fine settings are open (one at a time).
     expanded: Option<Stage>,
+    /// "Tune for my room" is open under its row.
+    tune_open: bool,
+    /// A measurement in progress, with the engine it measures with.
+    tuning: Option<(tune::Session, Option<EngineKind>)>,
+    /// The last finished measurement, until it's applied or started again.
+    tune_done: Option<(Result<Suggestion, Failure>, Option<EngineKind>)>,
+    /// The last result was applied (shows a short confirmation).
+    tune_applied: bool,
+    /// Mic too loud / too quiet, checked while the window is visible.
+    health: Health,
+    hints: Hints,
     /// Set if Windows refused to add/remove the "Start with Windows" entry.
     autostart_error: Option<String>,
     /// The value being typed in (one at a time) and its text box.
@@ -350,6 +363,14 @@ impl MainWindow {
                         last_sample = now;
                         this.sample();
                     }
+                    if visible.load(Relaxed) {
+                        this.check_tuning_and_health(st.as_deref(), now, cx);
+                    } else {
+                        // Measuring needs the user watching the steps: hiding cancels.
+                        this.tuning = None;
+                        this.health.reset();
+                        this.hints = Hints::default();
+                    }
                     if !visible.load(Relaxed) || this.about {
                         // Hidden (or the About page, which has no meters or readouts):
                         // forget the levels so the meters start from rest, and don't draw.
@@ -384,6 +405,12 @@ impl MainWindow {
             output_select,
             shown: Default::default(),
             expanded: None,
+            tune_open: false,
+            tuning: None,
+            tune_done: None,
+            tune_applied: false,
+            health: Health::default(),
+            hints: Hints::default(),
             autostart_error: None,
             editing: None,
             edit,
@@ -416,6 +443,236 @@ impl MainWindow {
         (self.last_cpu, self.last_wall) = (cpu, now);
         if let Some((_, private)) = stats::process_memory() {
             self.private_mb = private as f64 / 1_048_576.0;
+        }
+    }
+
+    /// On each refresh while visible: move a measurement on, and update the mic hints.
+    fn check_tuning_and_health(
+        &mut self,
+        st: Option<&stats::Stats>,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((t, engine)) = self.tuning.as_mut() {
+            let done = match t.tick() {
+                Phase::Done(r) => Some((r.clone(), *engine)),
+                _ => None,
+            };
+            if let Some(d) = done {
+                self.tuning = None;
+                self.tune_done = Some(d);
+            }
+            cx.notify(); // the progress bar moves
+        }
+        if let Some(s) = st {
+            let p = &self.params;
+            let boost = if p.agc.load(Relaxed) {
+                p.agc_max_db()
+            } else {
+                0.0
+            };
+            let hints = self.health.update(
+                now,
+                s.clip_frames.load(Relaxed),
+                s.speech_frames.load(Relaxed),
+                f32::from_bits(s.voice_db.load(Relaxed)),
+                boost,
+            );
+            if hints != self.hints {
+                self.hints = hints;
+                cx.notify();
+            }
+        }
+    }
+
+    fn start_tune(&mut self, cx: &mut Context<Self>) {
+        let (stats, engine) = self
+            .status
+            .lock()
+            .map(|s| (s.stats.clone(), s.engine))
+            .unwrap_or((None, None));
+        if let Some(stats) = stats {
+            self.tuning = Some((tune::Session::start(stats), engine));
+            self.tune_done = None;
+            self.tune_applied = false;
+        }
+        cx.notify();
+    }
+
+    /// Use the suggestion: set both values, move their sliders, save.
+    fn apply_tune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((Ok(s), _)) = self.tune_done.take() {
+            let p = Arc::clone(&self.params);
+            p.set_gate_threshold_db(s.gate_db);
+            p.set_agc_max_db(s.agc_max_db);
+            let (g, a) = (p.gate_threshold_db(), p.agc_max_db());
+            self.gate.update(cx, |sl, cx| sl.set_value(g, window, cx));
+            self.agc.update(cx, |sl, cx| sl.set_value(a, window, cx));
+            self.tune_applied = true;
+            save_soon(cx);
+        }
+        cx.notify();
+    }
+
+    /// "Tune for my room": a row like the chain stages, opening its steps below.
+    fn tune_row(&self, st: &Status, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.tune_open;
+        let hint = if self.tuning.is_some() {
+            "Measuring…"
+        } else {
+            "Sets the noise gate and auto gain for your mic"
+        };
+        let head = div()
+            .id("tune")
+            .flex()
+            .items_center()
+            .gap(SP_8)
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child("Tune for my room")
+                    .child(caption(hint)),
+            )
+            .child(
+                svg()
+                    .path(if open {
+                        assets::CHEVRON_DOWN
+                    } else {
+                        assets::CHEVRON_RIGHT
+                    })
+                    .size(px(14.0))
+                    .text_color(c(TEXT_SECONDARY)),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.tune_open = !open;
+                if open {
+                    // Closing stops a measurement and forgets an unapplied result.
+                    this.tuning = None;
+                    this.tune_done = None;
+                    this.tune_applied = false;
+                }
+                cx.notify();
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .py(SP_12)
+            .child(head)
+            .when(open, |d| d.child(self.tune_body(st, cx)))
+            .into_any_element()
+    }
+
+    /// The steps: start → stay quiet → talk → result (Apply / Try again).
+    fn tune_body(&self, st: &Status, cx: &mut Context<Self>) -> AnyElement {
+        let body = div().flex().flex_col().gap(SP_12).pt(SP_12);
+        let start_label = if self.tune_done.is_some() || self.tune_applied {
+            "Try again"
+        } else {
+            "Start"
+        };
+        let start = button("tune-start", start_label, self.tune_done.is_none())
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_tune(cx)));
+        let running = st.state == State::Running;
+        if let Some((t, _)) = &self.tuning {
+            let (title, hint) = match t.phase() {
+                Phase::Quiet => (
+                    "Stay quiet…",
+                    "Leave your usual sounds on: fan, game, typing.",
+                ),
+                _ => (
+                    "Now talk normally…",
+                    "Say a few sentences in your usual voice.",
+                ),
+            };
+            return body
+                .child(div().flex().flex_col().child(title).child(caption(hint)))
+                .child(progress_bar(t.progress()))
+                .child(
+                    div()
+                        .flex()
+                        .child(button("tune-cancel", "Cancel", false).on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                this.tuning = None;
+                                cx.notify();
+                            },
+                        ))),
+                )
+                .into_any_element();
+        }
+        match &self.tune_done {
+            Some((Ok(s), engine)) => {
+                let p = &self.params;
+                let mut notes: Vec<&'static str> = Vec::new();
+                if s.clipping {
+                    notes.push(
+                        "Your mic clipped while you talked. Lower its input volume in \
+                         Windows sound settings, then tune again.",
+                    );
+                }
+                if s.too_quiet {
+                    notes.push(
+                        "Your voice is very quiet, even with the most auto gain. Move closer \
+                         or raise the mic's input volume in Windows sound settings.",
+                    );
+                }
+                if s.noisy {
+                    notes.push(if *engine == Some(EngineKind::Dfn) {
+                        "Your room is loud next to your voice, so the gate can't fully \
+                         separate them."
+                    } else {
+                        "Your room is loud next to your voice, so the gate can't fully \
+                         separate them. High quality removes more noise; tune again with it."
+                    });
+                }
+                body.child(result_line(
+                    "Noise gate",
+                    db(p.gate_threshold_db()),
+                    db(s.gate_db),
+                ))
+                .child(result_line(
+                    "Auto gain",
+                    format!("Up to {}", db_signed(p.agc_max_db())),
+                    format!("Up to {}", db_signed(s.agc_max_db)),
+                ))
+                .child(caption(format!(
+                    "Measured with {}: room {}, voice {}.",
+                    engine.map_or("Off", engine_short),
+                    db(s.noise_db),
+                    db(s.voice_db)
+                )))
+                .children(notes.into_iter().map(note))
+                .child(
+                    div()
+                        .flex()
+                        .gap(SP_8)
+                        .child(button("tune-apply", "Apply", true).on_click(cx.listener(
+                            |this, _: &ClickEvent, window, cx| this.apply_tune(window, cx),
+                        )))
+                        .child(start),
+                )
+                .into_any_element()
+            }
+            Some((Err(f), _)) => body
+                .child(note(f.message()))
+                .child(div().flex().child(start))
+                .into_any_element(),
+            None if self.tune_applied => body
+                .child(caption(
+                    "Applied. You can still fine-tune the noise gate and auto gain below.",
+                ))
+                .child(div().flex().child(start))
+                .into_any_element(),
+            None => body
+                .child(caption(if running {
+                    "Takes 10 seconds: 5 quiet, then 5 talking. Nothing changes until you \
+                     apply it."
+                } else {
+                    "Start Sotto with your microphone first."
+                }))
+                .when(running, |d| d.child(div().flex().child(start)))
+                .into_any_element(),
         }
     }
 
@@ -1562,6 +1819,78 @@ fn level_meter(
         )
 }
 
+/// A small button: `primary` is `accent`-filled (one per group), the others outlined.
+fn button(id: &'static str, label: &'static str, primary: bool) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .px(SP_12)
+        .py(SP_4)
+        .rounded(RADIUS_CONTROL)
+        .border_1()
+        .text_size(px(LABEL))
+        .cursor_pointer()
+        .map(|d| {
+            if primary {
+                d.border_color(c(ACCENT))
+                    .bg(c(ACCENT))
+                    .text_color(c(BG))
+                    .font_weight(FontWeight::MEDIUM)
+                    .hover(|d| d.bg(c(ACCENT_HOVER)).border_color(c(ACCENT_HOVER)))
+            } else {
+                d.border_color(c(BORDER)).hover(|d| d.bg(c(ELEVATED)))
+            }
+        })
+        .child(label)
+}
+
+/// A thin progress bar: `accent` on an `elevated` track.
+fn progress_bar(done: f32) -> impl IntoElement {
+    div()
+        .h(px(4.0))
+        .rounded(RADIUS_CONTROL)
+        .bg(c(ELEVATED))
+        .overflow_hidden()
+        .child(
+            div()
+                .h_full()
+                .w(relative(done.clamp(0.0, 1.0)))
+                .bg(c(ACCENT)),
+        )
+}
+
+/// "Noise gate   −45 dB → −52 dB": the current value quiet, the suggestion bright.
+fn result_line(label: &'static str, now: String, new: String) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(SP_8)
+        .child(div().flex_1().child(label))
+        .child(numeric(div()).text_color(c(TEXT_SECONDARY)).child(now))
+        .child(div().text_color(c(TEXT_SECONDARY)).child("\u{2192}"))
+        .child(numeric(div()).font_weight(FontWeight::MEDIUM).child(new))
+}
+
+/// A one-line advisory: caption text with a 2px `warning` rule.
+fn note(text: &'static str) -> impl IntoElement {
+    div()
+        .pl(SP_8)
+        .border_l_2()
+        .border_color(c(WARNING))
+        .text_size(px(CAPTION))
+        .text_color(c(TEXT_PRIMARY))
+        .child(text)
+}
+
+/// The engine as the segmented control names it.
+fn engine_short(k: EngineKind) -> &'static str {
+    match k {
+        EngineKind::Off => "Off",
+        EngineKind::Rnnoise => "Light",
+        EngineKind::Dfn => "High quality",
+    }
+}
+
 /// Calm warning card: 2px `warning` rule on the left, text in `text_primary`.
 fn warning_card(what: impl Into<SharedString>, fix: impl Into<SharedString>) -> Div {
     div()
@@ -1685,6 +2014,25 @@ impl Render for MainWindow {
         if let Some(m) = &st.message {
             warnings.push(warning_card(m.clone(), "Nothing else was changed.").into_any_element());
         }
+        if running && self.hints.too_loud {
+            warnings.push(
+                warning_card(
+                    "Your microphone is too loud, so your voice distorts.",
+                    "Lower its input volume in Settings → System → Sound → your microphone.",
+                )
+                .into_any_element(),
+            );
+        }
+        if running && self.hints.too_quiet {
+            warnings.push(
+                warning_card(
+                    "Your voice is very quiet, even with auto gain.",
+                    "Move closer, or raise the input volume in Settings → System → Sound → \
+                     your microphone. Tune for my room can help too.",
+                )
+                .into_any_element(),
+            );
+        }
 
         let latency = st
             .latency_ms
@@ -1694,9 +2042,8 @@ impl Render for MainWindow {
         let gate_mark = (self.params.gate.load(Relaxed) && running)
             .then(|| meter::position(10f32.powf(self.params.gate_threshold_db() / 20.0)))
             .filter(|&x| x > 0.0);
-        let chain: Vec<AnyElement> = Stage::ALL
-            .into_iter()
-            .map(|s| self.stage_row(s, cx))
+        let chain: Vec<AnyElement> = std::iter::once(self.tune_row(&st, cx))
+            .chain(Stage::ALL.into_iter().map(|s| self.stage_row(s, cx)))
             .collect();
         let devices = vec![
             self.device_row(

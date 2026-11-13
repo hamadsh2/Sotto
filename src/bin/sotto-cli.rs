@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use sotto::control::{Change, Controller, EngineKind};
 use sotto::params::{EqPreset, Params};
+use sotto::tune::{self, Phase};
 use sotto::{devices, engine, stats};
 
 const USAGE: &str = "\
@@ -50,6 +51,8 @@ Commands (type, then Enter):
   eq custom 2 -2 3   your own EQ in dB (each -6 … 6): body ~150 Hz, mud ~350 Hz, presence ~4 kHz
   limiter on|off     limiter (never louder than -1 dBFS)
   strength 0-100     denoise mix: 0 = original, 100 = fully cleaned
+  tune               measure your room and voice (5 s quiet, then 5 s talking)
+  tune apply         use the suggested gate threshold and auto-gain limit
   status             show current settings
   stats              show the latest performance line
   report on|off      print that line every second (off = easier typing)
@@ -66,6 +69,8 @@ enum Cmd {
     /// is applied, so the flag always matches the running model.
     PostFilter(bool),
     ShowStatus,
+    Tune,
+    TuneApply,
 }
 
 /// Apply one typed command.
@@ -88,6 +93,8 @@ fn handle_command(line: &str, p: &Params) -> Cmd {
         },
         [] | ["help" | "?"] => println!("{COMMANDS}"),
         ["status"] => return Cmd::ShowStatus,
+        ["tune"] => return Cmd::Tune,
+        ["tune", "apply"] => return Cmd::TuneApply,
         ["hpf", v] => toggle("hpf", &p.hpf, v),
         ["gate", v @ ("on" | "off")] => toggle("gate", &p.gate, v),
         ["gate", v] => match v.parse::<f32>() {
@@ -297,6 +304,9 @@ fn run() -> Result<(), String> {
         }
     };
 
+    let mut tuning: Option<tune::Session> = None;
+    let mut suggestion: Option<tune::Suggestion> = None;
+
     print_status(&ctl.params, ctl.engine_kind());
     println!("Running. Type \"help\" for commands, \"q\" to stop.\n");
     loop {
@@ -337,6 +347,30 @@ fn run() -> Result<(), String> {
                 }
                 Cmd::ShowStatus => {
                     print_status(&ctl.params, ctl.engine_kind());
+                    continue;
+                }
+                Cmd::Tune => {
+                    if !ctl.is_running() {
+                        println!("> the microphone isn't running");
+                        continue;
+                    }
+                    tuning = Some(tune::Session::start(Arc::clone(&ctl.stats)));
+                    suggestion = None;
+                    println!("> tune: stay quiet for 5 s (leave your usual sounds on)…");
+                    continue;
+                }
+                Cmd::TuneApply => {
+                    match &suggestion {
+                        Some(s) => {
+                            ctl.params.set_gate_threshold_db(s.gate_db);
+                            ctl.params.set_agc_max_db(s.agc_max_db);
+                            println!(
+                                "> applied: gate {:.0} dBFS, agc max +{:.0} dB",
+                                s.gate_db, s.agc_max_db
+                            );
+                        }
+                        None => println!("> nothing to apply — type \"tune\" first"),
+                    }
                     continue;
                 }
                 Cmd::Report(on) => {
@@ -381,6 +415,36 @@ fn run() -> Result<(), String> {
             .is_some_and(|s| started.elapsed() >= Duration::from_secs(s))
         {
             break;
+        }
+
+        if let Some(t) = tuning.as_mut() {
+            let was_quiet = *t.phase() == Phase::Quiet;
+            match t.tick().clone() {
+                Phase::Talk if was_quiet => println!("> tune: now talk normally for 5 s…"),
+                Phase::Done(r) => {
+                    match r {
+                        Ok(s) => {
+                            println!(
+                                "> tune: noise {:.0} dB, voice {:.0} dB → gate {:.0} dBFS (now {:.0}), agc max +{:.0} dB (now +{:.0}){}{}{}",
+                                s.noise_db,
+                                s.voice_db,
+                                s.gate_db,
+                                ctl.params.gate_threshold_db(),
+                                s.agc_max_db,
+                                ctl.params.agc_max_db(),
+                                if s.noisy { " | noisy room" } else { "" },
+                                if s.too_quiet { " | mic too quiet" } else { "" },
+                                if s.clipping { " | mic clipping" } else { "" },
+                            );
+                            println!("> type \"tune apply\" to use these values");
+                            suggestion = Some(s);
+                        }
+                        Err(f) => println!("> tune: {}", f.message()),
+                    }
+                    tuning = None;
+                }
+                _ => {}
+            }
         }
 
         // ---- once-per-second report ----
