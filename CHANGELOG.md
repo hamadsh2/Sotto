@@ -10,7 +10,11 @@ All notable changes to Sotto. Versions follow [Semantic Versioning](https://semv
   leak with WebRTC's AEC3 echo canceller, before noise removal. Sotto only *listens* to what
   Windows plays to those headphones (a read-only loopback); it never plays anything to them,
   never changes their settings, and keeps nothing. Your headphones stay on your own DAC or
-  sound card, untouched.
+  sound card, untouched. Tuned for headphone leak rather than a speakerphone, so it doesn't
+  cut your own voice while you talk over the game or your friends (measured: 0.2–0.6 dB of
+  your voice touched, where WebRTC's default setting ate up to ~5 dB and whole syllables).
+- `sotto-cli` shows, while you talk, how much each stage (echo removal, noise removal,
+  EQ/gate/auto gain/limiter) changes your voice, and whether the mic clipped.
 
 ## [0.2.0] - 2026-11-14
 

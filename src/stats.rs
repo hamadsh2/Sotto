@@ -29,6 +29,9 @@ pub fn tune_bin(db: f32) -> usize {
     (db + 100.0).floor().clamp(0.0, (TUNE_BINS - 1) as f32) as usize
 }
 
+/// A frame counts as voice (for the per-stage readout) above this RMS, dBFS (after the high-pass).
+pub const LOUD_DB: f32 = -40.0;
+
 pub struct Stats {
     /// Per-frame processing-time histogram (audio thread writes, main thread reads+resets).
     hist: Box<[AtomicU32]>,
@@ -81,6 +84,12 @@ pub struct Stats {
     /// headphones → mic delay in ms; `i32::MIN` = not known / echo removal off.
     pub echo_erle_cdb: AtomicI32,
     pub echo_delay_ms: AtomicI32,
+    /// Voice frames only (input above `LOUD_DB`), approximate (a reset can race the
+    /// worker's update; diagnostics only): summed energy at each chain stage
+    /// (f32 bits; the worker is the only writer) and how many frames — so the main
+    /// thread can tell which stage turns a loud voice down, and by how much.
+    loud_e: [AtomicU32; 4],
+    loud_frames: AtomicU32,
     /// "Tune for my room" is measuring: the worker fills the histograms below.
     tuning: AtomicBool,
     /// While tuning, frames whose gate-detector level is at least this (dB, f32 bits)
@@ -129,6 +138,8 @@ impl Stats {
             echo_failed: AtomicBool::new(false),
             echo_erle_cdb: AtomicI32::new(i32::MIN),
             echo_delay_ms: AtomicI32::new(i32::MIN),
+            loud_e: Default::default(),
+            loud_frames: AtomicU32::new(0),
             tuning: AtomicBool::new(false),
             tune_voice_min_db: AtomicU32::new(0f32.to_bits()),
             tune_level: (0..TUNE_BINS).map(|_| AtomicU32::new(0)).collect(),
@@ -178,6 +189,14 @@ impl Stats {
             self.speech_frames.fetch_add(1, Relaxed);
         }
         self.voice_db.store(info.voice_db.to_bits(), Relaxed);
+        let loud = crate::dsp::db_to_lin(LOUD_DB);
+        if info.e_stages[0] >= loud * loud * crate::denoise::FRAME as f32 {
+            for (acc, e) in self.loud_e.iter().zip(info.e_stages) {
+                let v = f32::from_bits(acc.load(Relaxed)) + e;
+                acc.store(v.to_bits(), Relaxed);
+            }
+            self.loud_frames.fetch_add(1, Relaxed);
+        }
         if self.tuning.load(Relaxed) {
             self.tune_level[tune_bin(info.level_db)].fetch_add(1, Relaxed);
             let min = f32::from_bits(self.tune_voice_min_db.load(Relaxed));
@@ -185,6 +204,22 @@ impl Stats {
                 self.tune_voice[tune_bin(info.rms_db)].fetch_add(1, Relaxed);
             }
         }
+    }
+
+    /// Main thread: for the loud frames since the last call, how many there were and
+    /// the change in dB across echo removal, denoise (incl. strength mix), and
+    /// EQ+gate+auto gain+limiter. Resets.
+    pub fn take_loud(&self) -> Option<(u32, [f32; 3])> {
+        let n = self.loud_frames.swap(0, Relaxed);
+        let e: Vec<f32> = self
+            .loud_e
+            .iter()
+            .map(|a| f32::from_bits(a.swap(0, Relaxed)))
+            .collect();
+        (n > 0).then(|| {
+            let db = |a: f32, b: f32| 10.0 * (b.max(1e-12) / a.max(1e-12)).log10();
+            (n, [db(e[0], e[1]), db(e[1], e[2]), db(e[2], e[3])])
+        })
     }
 
     /// Main thread: start (or restart) a tuning measurement with empty histograms.

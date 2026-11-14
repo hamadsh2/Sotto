@@ -24,7 +24,7 @@
 
 use ringbuf::traits::{Consumer, Observer, Producer};
 use ringbuf::{HeapCons, HeapProd};
-use sonora::config::EchoCanceller;
+use sonora::config::{EchoCanceller, EchoCanceller3Config};
 use sonora::{AudioProcessing, Config, StreamConfig};
 
 use crate::denoise::FRAME;
@@ -41,6 +41,37 @@ const START_FRAMES: usize = 2;
 /// More than this queued (the headphones' clock runs a little faster than the mic's)
 /// → drop the oldest down to `START_FRAMES`, so the reference never lags far behind.
 const MAX_FRAMES: usize = 8;
+
+/// AEC3 tuned for headphone leak rather than a speakerphone.
+///
+/// AEC3 has two parts: a linear filter that *subtracts* its estimate of the echo (it can't
+/// touch your voice, which isn't correlated with what plays), and a suppressor that
+/// *turns down* frequency bands it thinks still hold echo. The suppressor is built for
+/// loud speaker echo; with open-back headphones it was cutting the user's own voice while
+/// they talked over the leak ("eating letters": measured live up to ~5 dB per second,
+/// and 4.5–6.7 dB on average in the double-talk test).
+///
+/// Here the suppressor only acts when the remaining echo clearly dominates: its
+/// echo-to-voice thresholds go from 0.07–1.1 to 90 (transparent) / 100 (full
+/// suppression) — 100 is the most sonora accepts — and its echo-to-masking threshold
+/// ×16. Measured in a double-talk test (speech-like voice over a 25 ms leak with reverb):
+/// voice loss 4.5 → 0.9 dB at −30 dB leak and 6.7 → 1.6 dB at −20 dB, for 19.1 → 15.4 dB
+/// and 29.4 → 27.8 dB of echo removed. The denoiser after it cleans most of what's left.
+pub fn gentle_config() -> EchoCanceller3Config {
+    let mut c = EchoCanceller3Config::default();
+    for t in [
+        &mut c.suppressor.normal_tuning,
+        &mut c.suppressor.nearend_tuning,
+    ] {
+        for m in [&mut t.mask_lf, &mut t.mask_hf] {
+            m.enr_transparent = 90.0;
+            m.enr_suppress = 100.0;
+            m.emr_transparent *= 16.0;
+        }
+    }
+    c.suppressor.high_bands_suppression.enr_threshold *= 1000.0;
+    c
+}
 
 /// Loopback callback side: downmix to mono and queue. No allocation, no locks.
 pub struct LoopbackTap {
@@ -103,6 +134,7 @@ impl EchoRef {
             })
             .capture_config(StreamConfig::new(SAMPLE_RATE, 1))
             .render_config(StreamConfig::new(rate, 1))
+            .echo_canceller3_config(gentle_config())
             .build();
         Ok(Self {
             apm,
@@ -248,8 +280,19 @@ mod tests {
         let talk = 6 * 48_000..8 * 48_000;
         let t2 = talk.clone();
         let (_, out) = run_leak(48_000, 8, |i| if t2.contains(&i) { near[i] } else { 0.0 });
-        let loss = 20.0 * (rms(&near[talk.clone()]) / rms(&out[talk])).log10();
-        assert!(loss.abs() < 3.0, "voice changed by {loss:.1} dB");
+        let loss = 20.0 * (rms(&near[talk.clone()]) / rms(&out[talk.clone()])).log10();
+        // Every 100 ms of talking too, not just the average: the default AEC3 suppressor
+        // "ate" single syllables (worst 100 ms: 14.4 dB) while the average looked fine.
+        let worst = talk
+            .step_by(4_800)
+            .map(|i| {
+                let w = i..i + 4_800;
+                20.0 * (rms(&near[w.clone()]) / rms(&out[w])).log10()
+            })
+            .fold(f32::MIN, f32::max);
+        assert!(loss.abs() < 1.0, "voice changed by {loss:.1} dB");
+        // This leak is very loud (-14 dB); the default suppressor lost 14.4 dB here.
+        assert!(worst < 7.0, "a 100 ms stretch of voice lost {worst:.1} dB");
     }
 
     #[test]
@@ -284,6 +327,12 @@ mod tests {
         aec.process(&mut x);
         assert!(aec.priming);
         assert_eq!(aec.ref_buf.iter().sum::<f32>(), 0.0);
+    }
+
+    #[test]
+    fn gentle_config_is_valid_as_is() {
+        // sonora clamps invalid values (with a warning) — ours must pass unchanged.
+        assert!(gentle_config().validate());
     }
 
     #[test]

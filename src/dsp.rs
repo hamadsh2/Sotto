@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 const SR: f64 = 48_000.0;
 
-fn db_to_lin(db: f32) -> f32 {
+pub(crate) fn db_to_lin(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
@@ -426,6 +426,10 @@ impl Delay {
     }
 }
 
+fn energy(x: &[f32; FRAME]) -> f32 {
+    x.iter().map(|s| s * s).sum()
+}
+
 // ---------------------------------------------------------------------------
 // The whole chain.
 // ---------------------------------------------------------------------------
@@ -448,6 +452,9 @@ pub struct FrameInfo {
     pub speaking: bool,
     /// The auto gain's measured voice level, before its gain, dB.
     pub voice_db: f32,
+    /// Sum of squares of this frame at each stage (for the per-stage loss readout):
+    /// after the high-pass, after echo removal, after denoise, and the final output.
+    pub e_stages: [f32; 4],
 }
 
 /// A denoise engine plus the dry-path delay matched to its latency, so the strength
@@ -674,9 +681,11 @@ impl Chain {
 
         // 1b. Echo removal: subtract what the headphones leaked into the mic, before the
         // denoiser (which then cleans whatever AEC3 leaves).
+        let e_pre = energy(&self.a);
         if let Some(e) = self.echo.as_mut() {
             e.process(&mut self.a);
         }
+        let e_aec = energy(&self.a);
 
         // 2. Denoise → self.b, mixed with the (delay-matched) dry signal by strength.
         for s in self.strength_buf.iter_mut() {
@@ -709,6 +718,8 @@ impl Chain {
             let old = std::mem::replace(&mut self.engine, sw.next);
             self.retired = Some(old);
         }
+
+        let e_den = energy(&self.b);
 
         // 2c. EQ (always runs; faded in/out by `eq_amt` like the other stages; a preset
         // change crossfades inside `Eq`).
@@ -765,6 +776,7 @@ impl Chain {
             rms_db: 10.0 * (sum_sq / FRAME as f32).max(1e-18).log10(),
             speaking: n_voiced >= FRAME / 2,
             voice_db: self.agc.level_db(),
+            e_stages: [e_pre, e_aec, e_den, energy(out)],
         }
     }
 }

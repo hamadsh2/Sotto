@@ -549,6 +549,22 @@ fn run() -> Result<(), String> {
                 (sotto::control::EchoState::Waiting(_), _) => " | echo waiting".into(),
                 _ => String::new(),
             };
+            let loud_txt = match st.take_loud() {
+                Some((n, [aec, den, rest])) => {
+                    // Only while echo removal runs (otherwise that stage is a no-op).
+                    let aec = if matches!(ctl.echo_state(), sotto::control::EchoState::On(_)) {
+                        format!("echo {aec:+5.1} dB, ")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        " | voice {n:>3} fr: {aec}denoise {den:+5.1} dB, eq/gate/agc/lim {rest:+5.1} dB | clipped total {}",
+                        st.clip_frames.load(Relaxed)
+                    )
+                }
+                None => String::new(),
+            };
+            let echo_txt = format!("{echo_txt}{loud_txt}");
             last_report = format!(
                 "{:<7} | frames {:>3} | proc p50 {:>5.3} ms  p99 {:>5.3} ms  max {:>6.3} ms | \
                  CPU {:>5.2}% | RAM {:>5.1} MB (private {:>5.1}) | buffer avg {:>4.1} ms | \
