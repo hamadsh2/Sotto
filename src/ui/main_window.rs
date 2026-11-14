@@ -1997,6 +1997,17 @@ fn warning_card(what: impl Into<SharedString>, fix: impl Into<SharedString>) -> 
         .child(div().text_color(c(TEXT_SECONDARY)).child(fix.into()))
 }
 
+/// One numbered step inside a warning card.
+fn step(n: u8, text: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .w_full()
+        .gap(SP_8)
+        .text_color(c(TEXT_SECONDARY))
+        .child(div().flex_none().child(format!("{n}.")))
+        .child(div().flex_1().min_w_0().child(text))
+}
+
 /// Header: the Sotto mark, wordmark and tagline, and a small status pill.
 fn header(state: &State, muted: bool) -> impl IntoElement {
     let (dot, text) = match state {
@@ -2062,8 +2073,12 @@ impl Render for MainWindow {
             warnings.push(
                 warning_card(
                     "VB-Cable isn't installed, so Sotto has nowhere to send your voice.",
-                    "Install it from VB-Audio's official page, restart Windows, then reopen Sotto.",
+                    "It's free and takes a minute:",
                 )
+                .child(step(1, "On VB-Audio's page, download the \"New Package\" zip (VBCABLE_Driver_Pack46 or newer), not the old one."))
+                .child(step(2, "Extract all the files from the zip."))
+                .child(step(3, "Right-click VBCABLE_Setup_x64.exe, choose \"Run as administrator\", then click Install Driver."))
+                .child(step(4, "Restart Windows, then open Sotto."))
                 .child(
                     div()
                         .id("get-vb-cable")

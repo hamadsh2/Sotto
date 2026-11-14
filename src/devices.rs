@@ -128,8 +128,11 @@ pub fn find_output(host: &Host, query: Option<&str>) -> Result<Named, String> {
     if cables.is_empty() {
         return Err(format!(
             "VB-Cable is not installed (no \"CABLE Input\" device found).\n\
-             Install it from the official VB-Audio page: {VB_CABLE_URL}\n\
-             then restart Windows and run Sotto again."
+             1. On {VB_CABLE_URL} download the \"New Package\" zip \
+             (VBCABLE_Driver_Pack46 or newer), not the old one.\n\
+             2. Extract all the files.\n\
+             3. Right-click VBCABLE_Setup_x64.exe, Run as administrator, Install Driver.\n\
+             4. Restart Windows and run Sotto again."
         ));
     }
     pick(cables, query.unwrap_or(CABLE_INPUT), "VB-Cable output").map_err(|e| {

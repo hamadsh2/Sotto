@@ -36,8 +36,10 @@ so Discord, games and calls hear only you. Small, CPU-only, quiet while you play
 
 Windows 10 or 11 (64-bit).
 
-1. **Install [VB-Cable](https://vb-audio.com/Cable/)**, a free virtual audio cable
-   (run `VBCABLE_Setup_x64.exe` as administrator), then restart Windows.
+1. **Install [VB-Cable](https://vb-audio.com/Cable/)**, a free virtual audio cable:
+   download the **"New Package"** zip (`VBCABLE_Driver_Pack46` or newer, not the old
+   one), extract all the files, right-click `VBCABLE_Setup_x64.exe` → **Run as
+   administrator** → **Install Driver**, then restart Windows.
 2. **Install Sotto** from [Releases](https://github.com/hamadsh2/Sotto/releases/latest):
    run `Sotto-<version>-setup.exe`. No admin rights needed.
 3. **In Sotto,** pick your microphone and **CABLE Input**.
@@ -64,9 +66,13 @@ delete that folder to remove them too.
 
 ## Your audio stays yours
 
-Sotto opens exactly **two** devices: the microphone you choose and VB-Cable's **CABLE Input**.
+Sotto streams on exactly **two** devices: the microphone you choose and VB-Cable's **CABLE Input**.
 
-- It **never touches your headphones, speakers or DAC**, and has no "listen to yourself" feature.
+- It **never streams live to your headphones, speakers or DAC**, so your voice is never doubled
+  in a screen share or recording. The one exception is **Hear yourself**: when you click Play,
+  it plays a 5-second clip of your cleaned voice you just recorded, once, on your default
+  playback device, then closes it. The clip stays in memory and is never sent to a virtual
+  cable, Voicemeeter or Sotto's own output.
 - It **never changes Windows sound settings**: not your default devices, volume, formats or enhancements.
 - It uses WASAPI **shared mode** only, so other apps can still use your mic.
 - It creates no virtual devices, and never switches to another device: if one you chose is unplugged, it waits.
