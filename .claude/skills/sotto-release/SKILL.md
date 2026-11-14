@@ -74,7 +74,7 @@ codegen-units = 1
 - [ ] Summary of changes from `CHANGELOG.md`.
 - [ ] SHA-256 for each asset.
 - [ ] Line: "Official builds are published only on this repository's Releases page."
-- [ ] Line: "Sotto never touches your headphones, speakers, or Windows audio settings."
+- [ ] Line: "Sotto never streams live to your headphones or speakers (Hear yourself plays a short clip once, only when you click Play), and never changes Windows audio settings."
 
 ## 7. README checks
 - [ ] What Sotto does (one paragraph + screenshot).

@@ -188,7 +188,7 @@ jobs:
             echo
             cat changes.md
             echo
-            echo "Sotto never touches your headphones, speakers, or Windows audio settings."
+            echo "Sotto never streams live to your headphones or speakers (Hear yourself plays a short clip once, only when you click Play), and never changes Windows audio settings."
             echo
             echo "Official builds are published only on this repository's Releases page."
             echo
