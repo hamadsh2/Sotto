@@ -246,8 +246,8 @@ pub struct MainWindow {
     rec_focus: FocusHandle,
     /// Why the last pressed shortcut wasn't accepted.
     rec_error: Option<String>,
-    /// The About page is shown instead of the controls.
-    about: bool,
+    /// Which page is shown: the main controls, Settings, or About.
+    page: Page,
     /// The license opened on the About page (0 = Sotto's own, n = third-party n-1) and
     /// its text reflowed for the window's width.
     open_license: Option<(usize, SharedString)>,
@@ -395,11 +395,15 @@ impl MainWindow {
                             send(Command::ForgetClip, cx);
                         }
                     }
-                    if !visible.load(Relaxed) || this.about {
-                        // Hidden (or the About page, which has no meters or readouts):
-                        // forget the levels so the meters start from rest, and don't draw.
+                    if !visible.load(Relaxed) || this.page != Page::Main {
+                        // Hidden, or a page without meters: forget the levels so the
+                        // meters start from rest. Settings still shows live states
+                        // (echo removal, update check), so it redraws once a second.
                         this.meter_in.reset();
                         this.meter_out.reset();
+                        if visible.load(Relaxed) && this.page == Page::Settings && second {
+                            cx.notify();
+                        }
                         return;
                     }
                     let was_moving = this.meter_in.is_moving() || this.meter_out.is_moving();
@@ -443,7 +447,7 @@ impl MainWindow {
             recording: false,
             rec_focus: cx.focus_handle(),
             rec_error: None,
-            about: false,
+            page: Page::Main,
             open_license: None,
             meter_in: Meter::default(),
             meter_out: Meter::default(),
@@ -546,7 +550,7 @@ impl MainWindow {
         let hint = if self.tuning.is_some() {
             "Measuring…"
         } else {
-            "Sets the noise gate and auto gain for your mic"
+            "Sets the gate and auto gain for your mic"
         };
         let head = div()
             .id("tune")
@@ -717,43 +721,41 @@ impl MainWindow {
         let (hint, controls): (SharedString, Div) = match st.hear {
             Hear::Recording => (
                 "Recording… talk normally.".into(),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(SP_12)
-                    .child(div().flex_1().child(progress_bar(st.hear_progress)))
-                    .child(button("hear-stop", "Cancel", false).on_click(click(|| Command::StopHear))),
+                div().flex().child(
+                    button("hear-stop", "Cancel", false).on_click(click(|| Command::StopHear)),
+                ),
             ),
             Hear::Playing => (
                 "Playing in your headphones…".into(),
-                div()
-                    .flex()
-                    .child(button("hear-stop", "Stop", false).on_click(click(|| Command::StopHear))),
+                div().flex().child(
+                    button("hear-stop", "Stop", false).on_click(click(|| Command::StopHear)),
+                ),
             ),
             Hear::Ready => (
-                "Plays once in your headphones. If you're sharing your screen, viewers hear it too."
-                    .into(),
+                "Plays once. Screen-share viewers hear it too.".into(),
                 div()
                     .flex()
                     .gap(SP_8)
                     .child(button("hear-play", "Play", true).on_click(click(|| Command::Play)))
                     .when(running && !muted, |d| {
                         d.child(
-                            button("hear-record", "Record again", false)
+                            button("hear-record", "Redo", false)
                                 .on_click(click(|| Command::Record)),
                         )
                     }),
             ),
             Hear::Idle => (
                 if !running {
-                    "Start Sotto with your microphone first.".into()
+                    "Choose a microphone first.".into()
                 } else if muted {
                     "Unmute to record.".into()
                 } else {
-                    "Record 5 seconds of what others hear, then play it back once.".into()
+                    "Record 5 s of what others hear.".into()
                 },
                 div().flex().when(running && !muted, |d| {
-                    d.child(button("hear-record", "Record", true).on_click(click(|| Command::Record)))
+                    d.child(
+                        button("hear-record", "Record", true).on_click(click(|| Command::Record)),
+                    )
                 }),
             ),
         };
@@ -767,12 +769,23 @@ impl MainWindow {
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .child("Hear yourself")
-                    .child(caption(hint)),
+                    .items_center()
+                    .gap(SP_12)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child("Hear yourself")
+                            .child(caption(hint)),
+                    )
+                    .child(controls.flex_none()),
             )
+            .when(st.hear == Hear::Recording, |d| {
+                d.child(progress_bar(st.hear_progress))
+            })
             .when_some(st.hear_error.clone(), |d, e| d.child(note(e)))
-            .child(controls)
             .into_any_element()
     }
 
@@ -817,8 +830,6 @@ impl MainWindow {
             (None, Some(k)) => k.label(),
             (None, None) => "",
         };
-        let pf_on = self.params.dfn_postfilter.load(Relaxed);
-        let loading = st.loading.is_some();
         card("Noise removal")
             .child(segmented(
                 segments.into_iter().map(|(kind, title)| {
@@ -837,41 +848,41 @@ impl MainWindow {
             ))
             .child(div().mb(SP_8).child(caption(hint)))
             .child(self.strength_row(st, cx))
-            .when(st.engine == Some(EngineKind::Dfn), |d| {
-                d.child(
-                    div()
-                        .mt(SP_8)
-                        .pt(SP_12)
-                        .border_t_1()
-                        .border_color(c(BORDER))
-                        .flex()
-                        .items_center()
-                        .gap(SP_12)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child("Post-filter")
-                                .child(caption("Removes more noise. Can sound a little thinner.")),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .when(!loading, |d| d.cursor_pointer())
-                                .child(
-                                    Switch::new("postfilter")
-                                        .checked(pf_on)
-                                        .disabled(loading)
-                                        .on_click(|on: &bool, _, cx| {
-                                            send(Command::SetPostFilter(*on), cx);
-                                            save_soon(cx);
-                                        }),
-                                ),
-                        ),
-                )
-            })
+    }
+
+    /// High quality's post-filter (Settings → Voice, only while High quality is on).
+    fn postfilter_row(&self, st: &Status) -> AnyElement {
+        let pf_on = self.params.dfn_postfilter.load(Relaxed);
+        let loading = st.loading.is_some();
+        div()
+            .flex()
+            .items_center()
+            .gap(SP_12)
+            .py(SP_12)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child("Post-filter")
+                    .child(caption("High quality: more removal, a bit thinner.")),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .when(!loading, |d| d.cursor_pointer())
+                    .child(
+                        Switch::new("postfilter")
+                            .checked(pf_on)
+                            .disabled(loading)
+                            .on_click(|on: &bool, _, cx| {
+                                send(Command::SetPostFilter(*on), cx);
+                                save_soon(cx);
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The value as plain text for typing (a normal minus, no unit).
@@ -1111,8 +1122,14 @@ impl MainWindow {
     }
 
     /// Mute switch. Same action as the tray item and the shortcut.
-    fn mute_row(&self) -> AnyElement {
+    fn mute_row(&self, cx: &App) -> AnyElement {
         let muted = self.params.muted.load(Relaxed);
+        let shortcut = cx
+            .global::<AppState>()
+            .hotkeys
+            .as_ref()
+            .and_then(|h| h.current())
+            .map(hotkey::label);
         div()
             .flex()
             .items_center()
@@ -1125,10 +1142,10 @@ impl MainWindow {
                     .flex()
                     .flex_col()
                     .child("Mute")
-                    .child(caption(if muted {
-                        "Nothing is sent to CABLE Input"
-                    } else {
-                        "Silences your voice everywhere at once"
+                    .child(caption(match (muted, shortcut) {
+                        (true, _) => SharedString::from("Nothing is sent to CABLE Input"),
+                        (false, Some(k)) => format!("Shortcut: {k}").into(),
+                        (false, None) => "Silences your voice everywhere".into(),
                     })),
             )
             .child(
@@ -1312,7 +1329,7 @@ impl MainWindow {
                     )
                     .child("Back")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.about = false;
+                        this.page = Page::Settings;
                         this.open_license = None;
                         cx.notify();
                     })),
@@ -1498,9 +1515,9 @@ impl MainWindow {
             _ => None,
         };
         let hint: SharedString = if on {
-            "Viewers of a whole-screen share won't hear your voice twice.".into()
+            "Screen-share viewers won't hear you twice.".into()
         } else {
-            "Off: a whole-screen share in Discord also picks up your voice.".into()
+            "Off: whole-screen shares pick up your voice.".into()
         };
         div()
             .flex()
@@ -1553,15 +1570,12 @@ impl MainWindow {
             .and_then(|s| s.echo_readings().0)
             .filter(|db| *db >= 1.0);
         let (hint, problem): (SharedString, Option<String>) = match (&st.echo, on) {
-            (_, false) => (
-                "For open-back headphones: removes what they leak into your mic.".into(),
-                None,
-            ),
-            _ if st.headphones.is_none() => ("Choose your headphones above.".into(), None),
+            (_, false) => ("For open-back headphones.".into(), None),
+            _ if st.headphones.is_none() => ("Choose your headphones in Settings.".into(), None),
             (Some(EchoState::On(_)), true) => (
                 match removing {
                     Some(db) => format!("On — removing about {db:.0} dB of echo.").into(),
-                    None => "On — listening to your headphones (never plays to them).".into(),
+                    None => "On — listening to your headphones.".into(),
                 },
                 None,
             ),
@@ -1744,7 +1758,7 @@ impl MainWindow {
                     .text_color(c(TEXT_SECONDARY)),
             )
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.about = true;
+                this.page = Page::About;
                 cx.notify();
             }))
             .into_any_element()
@@ -2189,11 +2203,14 @@ fn header(state: &State, muted: bool) -> impl IntoElement {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.about {
+        if self.page == Page::About {
             return page("about").child(self.about_page(cx));
         }
         let st = self.status.lock().map(|s| s.clone()).unwrap_or_default();
         self.sync_pickers(&st, window, cx);
+        if self.page == Page::Settings {
+            return page("settings").child(self.settings_page(&st, cx));
+        }
         let running = st.state == State::Running;
         let muted = self.params.muted.load(Relaxed);
 
@@ -2277,37 +2294,6 @@ impl Render for MainWindow {
         let gate_mark = (self.params.gate.load(Relaxed) && running)
             .then(|| meter::position(10f32.powf(self.params.gate_threshold_db() / 20.0)))
             .filter(|&x| x > 0.0);
-        let chain: Vec<AnyElement> = std::iter::once(self.tune_row(&st, cx))
-            .chain(Stage::ALL.into_iter().map(|s| self.stage_row(s, cx)))
-            .collect();
-        let devices = vec![
-            self.device_row(
-                assets::MIC,
-                "Microphone",
-                &self.input_select,
-                "Choose your microphone",
-                st.inputs.is_empty(),
-            )
-            .into_any_element(),
-            self.device_row(
-                assets::PLUG,
-                "Output (VB-Cable)",
-                &self.output_select,
-                "Choose CABLE Input",
-                st.outputs.is_empty(),
-            )
-            .into_any_element(),
-            self.hide_row(&st, cx),
-            self.device_row(
-                assets::HEADPHONES,
-                "Headphones (for echo removal)",
-                &self.headphones_select,
-                "Choose your headphones",
-                st.headphone_list.is_empty(),
-            )
-            .into_any_element(),
-            self.echo_row(&st, cx),
-        ];
         let readout = |label: &'static str, value: String| {
             div()
                 .flex()
@@ -2328,18 +2314,11 @@ impl Render for MainWindow {
                         .child(level_meter("Output", self.meter_out, running, None, false))
                         .child(self.hear_row(&st, cx)),
                 )
-                .child(list_card(devices))
-                .child(list_card(chain))
-                .child(list_card(vec![self.mute_row(), self.shortcut_row(cx)]))
-                .child(list_card(vec![
-                    self.startup_row(cx),
-                    self.auto_update_row(cx),
-                    self.update_row(cx),
-                    self.about_row(cx),
-                ]))
+                .child(list_card(vec![self.echo_row(&st, cx), self.mute_row(cx)]))
                 .child(
                     div()
                         .flex()
+                        .items_center()
                         .gap(SP_8)
                         .text_size(px(CAPTION))
                         .text_color(c(TEXT_SECONDARY))
@@ -2347,10 +2326,144 @@ impl Render for MainWindow {
                         .child("·")
                         .child(readout("Latency", latency))
                         .child("·")
-                        .child(readout("Memory", format!("{:.0} MB", self.private_mb))),
+                        .child(readout("Memory", format!("{:.0} MB", self.private_mb)))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("open-settings")
+                                .flex()
+                                .items_center()
+                                .gap(SP_4)
+                                .text_size(px(BODY))
+                                .text_color(c(TEXT_PRIMARY))
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(c(ACCENT)))
+                                .child("Settings")
+                                .child(
+                                    svg()
+                                        .path(assets::CHEVRON_RIGHT)
+                                        .size(px(14.0))
+                                        .text_color(c(TEXT_SECONDARY)),
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.page = Page::Settings;
+                                    cx.notify();
+                                })),
+                        ),
                 ),
         )
     }
+}
+
+impl MainWindow {
+    /// Settings: everything you set once — devices, the voice chain, the shortcut and
+    /// the app itself.
+    fn settings_page(&self, st: &Status, cx: &mut Context<Self>) -> impl IntoElement {
+        let devices = vec![
+            self.device_row(
+                assets::MIC,
+                "Microphone",
+                &self.input_select,
+                "Choose your microphone",
+                st.inputs.is_empty(),
+            )
+            .into_any_element(),
+            self.device_row(
+                assets::PLUG,
+                "Output (VB-Cable)",
+                &self.output_select,
+                "Choose CABLE Input",
+                st.outputs.is_empty(),
+            )
+            .into_any_element(),
+            self.device_row(
+                assets::HEADPHONES,
+                "Headphones (for echo removal)",
+                &self.headphones_select,
+                "Choose your headphones",
+                st.headphone_list.is_empty(),
+            )
+            .into_any_element(),
+            self.hide_row(st, cx),
+        ];
+        let mut voice: Vec<AnyElement> = std::iter::once(self.tune_row(st, cx))
+            .chain(Stage::ALL.into_iter().map(|s| self.stage_row(s, cx)))
+            .collect();
+        if st.engine == Some(EngineKind::Dfn) {
+            voice.push(self.postfilter_row(st));
+        }
+        column()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(SP_12)
+                    .child(
+                        div()
+                            .id("settings-back")
+                            .flex()
+                            .items_center()
+                            .gap(SP_4)
+                            .text_color(c(TEXT_SECONDARY))
+                            .cursor_pointer()
+                            .hover(|d| d.text_color(c(TEXT_PRIMARY)))
+                            .child(
+                                svg()
+                                    .path(assets::CHEVRON_LEFT)
+                                    .size(px(16.0))
+                                    .text_color(c(TEXT_SECONDARY)),
+                            )
+                            .child("Back")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.page = Page::Main;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(HEADING))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Settings"),
+                    ),
+            )
+            .child(section("Devices", devices))
+            .child(section("Voice", voice))
+            .child(section("Shortcut", vec![self.shortcut_row(cx)]))
+            .child(section(
+                "App",
+                vec![
+                    self.startup_row(cx),
+                    self.auto_update_row(cx),
+                    self.update_row(cx),
+                    self.about_row(cx),
+                ],
+            ))
+    }
+}
+
+/// Which page the window shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Main,
+    Settings,
+    About,
+}
+
+/// A titled group of rows on the Settings page.
+fn section(title: &'static str, rows: Vec<AnyElement>) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(SP_8)
+        .child(
+            div()
+                .px(SP_4)
+                .text_size(px(LABEL))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(c(TEXT_SECONDARY))
+                .child(title),
+        )
+        .child(list_card(rows))
 }
 
 #[cfg(test)]

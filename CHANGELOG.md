@@ -16,6 +16,11 @@ All notable changes to Sotto. Versions follow [Semantic Versioning](https://semv
 - `sotto-cli` shows, while you talk, how much each stage (echo removal, noise removal,
   EQ/gate/auto gain/limiter) changes your voice, and whether the mic clipped.
 
+### Changed
+- **Simpler window.** The main screen now fits without scrolling: noise removal, levels,
+  Hear yourself, headphone echo and mute (with its shortcut shown). Devices, the voice
+  chain, the mute shortcut and app options moved to a new **Settings** page (bottom right).
+
 ## [0.2.0] - 2026-11-14
 
 ### Added
