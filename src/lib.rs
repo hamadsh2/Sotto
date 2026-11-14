@@ -7,6 +7,7 @@ pub mod denoise;
 pub mod devices;
 pub mod dfn;
 pub mod dsp;
+pub mod echo;
 pub mod engine;
 pub mod eq;
 pub mod exclusive;

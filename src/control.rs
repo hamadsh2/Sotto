@@ -110,7 +110,29 @@ pub struct Controller {
     opened_at: Option<Instant>,
     exclusive_strikes: u32,
     exclusive_off: Option<String>,
+    /// Headphones picked for echo removal (`None` until the user picks them).
+    headphones: Option<Chosen>,
+    /// The running read-only loopback capture of those headphones.
+    echo: Option<engine::EchoStream>,
+    /// Why echo removal is waiting (shown once in notes, and by `echo_state`).
+    echo_error: Option<String>,
+    /// Last attempt to start echo removal (retried every few seconds while wanted).
+    echo_tried: Option<Instant>,
 }
+
+/// Where echo removal stands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EchoState {
+    /// Turned off, or no headphones picked.
+    Off,
+    /// Wanted, but not running; the reason.
+    Waiting(String),
+    /// Listening to the headphones; their format, e.g. "2ch 48 kHz".
+    On(String),
+}
+
+/// How often to retry starting echo removal while it can't run.
+const ECHO_RETRY: Duration = Duration::from_secs(3);
 
 /// Exclusive output that dies sooner than this after opening counts as a strike.
 const EXCLUSIVE_GRACE: Duration = Duration::from_secs(10);
@@ -182,6 +204,10 @@ impl Controller {
             opened_at: None,
             exclusive_strikes: 0,
             exclusive_off: None,
+            headphones: None,
+            echo: None,
+            echo_error: None,
+            echo_tried: None,
         })
     }
 
@@ -199,6 +225,31 @@ impl Controller {
 
     pub fn output_name(&self) -> &str {
         self.output.as_ref().map_or("", |c| c.name.as_str())
+    }
+
+    /// Headphones picked for echo removal.
+    pub fn headphones(&self) -> Option<&Chosen> {
+        self.headphones.as_ref()
+    }
+
+    pub fn echo_state(&self) -> EchoState {
+        match (&self.echo, &self.echo_error) {
+            (Some(e), _) => EchoState::On(e.format.clone()),
+            (None, Some(why)) if self.echo_wanted() => EchoState::Waiting(why.clone()),
+            _ => EchoState::Off,
+        }
+    }
+
+    fn echo_wanted(&self) -> bool {
+        self.params.echo.load(Relaxed) && self.headphones.is_some()
+    }
+
+    /// Stop the headphones loopback and take echo removal out of the chain.
+    fn stop_echo(&mut self) {
+        self.echo = None; // stops the loopback capture
+        if let Some(w) = self.worker.as_ref() {
+            let _ = w.set_echo(None);
+        }
     }
 
     /// The devices the user may choose from right now (mics; VB-Cable outputs only).
@@ -224,6 +275,7 @@ impl Controller {
             .ok_or_else(|| match dir {
                 Dir::Input => "That microphone is not connected.".to_string(),
                 Dir::Output => "That VB-Cable output is not available.".to_string(),
+                Dir::Headphones => "Those headphones are not connected.".to_string(),
             })?;
         let chosen = Some(Chosen {
             id: found.id,
@@ -232,11 +284,19 @@ impl Controller {
         let slot = match dir {
             Dir::Input => &mut self.input,
             Dir::Output => &mut self.output,
+            Dir::Headphones => &mut self.headphones,
         };
         if *slot == chosen {
             return Ok(());
         }
         *slot = chosen;
+        if dir == Dir::Headphones {
+            // Only echo removal restarts (on the new headphones); the voice keeps flowing.
+            self.stop_echo();
+            self.echo_error = None;
+            self.echo_tried = None;
+            return Ok(());
+        }
         self.streams = None; // stops both streams; tick() opens the new pair
         self.lost_reported = false;
         Ok(())
@@ -256,6 +316,9 @@ impl Controller {
         if dir == Dir::Input && devices::is_vb_cable(name) {
             return Err("The saved microphone is a VB-Cable device; choose it again.".into());
         }
+        if dir == Dir::Headphones && devices::is_virtual(name) {
+            return Err("The saved headphones are a virtual device; choose them again.".into());
+        }
         let chosen = Some(Chosen {
             id,
             name: name.to_string(),
@@ -263,6 +326,13 @@ impl Controller {
         match dir {
             Dir::Input => self.input = chosen,
             Dir::Output => self.output = chosen,
+            Dir::Headphones => {
+                self.headphones = chosen;
+                self.stop_echo();
+                self.echo_error = None;
+                self.echo_tried = None;
+                return Ok(());
+            }
         }
         self.streams = None;
         self.lost_reported = false;
@@ -311,6 +381,7 @@ impl Controller {
             return Err("the engine is stopped".into());
         };
         if self.stats.worker_failed.load(Relaxed) {
+            self.echo = None; // the headphones loopback stops with the voice streams
             self.streams = None;
             return Err("the denoise engine stopped unexpectedly".into());
         }
@@ -407,7 +478,71 @@ impl Controller {
                 Err(_) => {}
             }
         }
+        self.tick_echo();
         Ok(())
+    }
+
+    /// Echo removal follows the setting and the streams: it runs only while the voice
+    /// streams do, the setting is on and headphones are picked. If the headphones go
+    /// away it pauses and retries every few seconds — only ever those exact headphones.
+    fn tick_echo(&mut self) {
+        if let Some(w) = self.worker.as_ref() {
+            while let Ok(old) = w.retired_echo.try_recv() {
+                drop(old); // AEC3's memory is freed here, not on the audio path
+            }
+        }
+        let want = self.echo_wanted() && self.streams.is_some();
+        if self.echo.is_some() {
+            if !want {
+                self.stop_echo();
+                self.echo_error = None;
+            } else if self.stats.echo_failed.load(Relaxed) {
+                self.stop_echo();
+                let why = "the headphones stopped (unplugged or their format changed)";
+                self.notes.push(format!("Echo removal paused: {why}."));
+                self.echo_error = Some(why.to_string());
+                self.echo_tried = Some(Instant::now());
+            }
+            return;
+        }
+        if !want {
+            self.echo_error = None;
+            self.echo_tried = None;
+            return;
+        }
+        if self.echo_tried.is_some_and(|t| t.elapsed() < ECHO_RETRY) {
+            return;
+        }
+        self.echo_tried = Some(Instant::now());
+        let (Some(hp), Some(worker)) = (self.headphones.as_ref(), self.worker.as_ref()) else {
+            return;
+        };
+        let attempt =
+            devices::find_chosen(&self.host, Dir::Headphones, &hp.id, &hp.name).and_then(|d| {
+                let es = devices::no_panic("starting echo removal", || {
+                    engine::start_echo(&d.device, worker, Arc::clone(&self.stats))
+                })?;
+                Ok((es, d.id))
+            });
+        match attempt {
+            Ok((es, id)) => {
+                self.notes.push(format!(
+                    "Echo removal on: listening to \"{}\" ({}, read-only).",
+                    hp.name, es.format
+                ));
+                if let Some(h) = self.headphones.as_mut() {
+                    h.id = id;
+                }
+                self.echo = Some(es);
+                self.echo_error = None;
+            }
+            Err(e) => {
+                if self.echo_error.as_deref() != Some(e.as_str()) {
+                    self.notes.push(format!("Echo removal waiting: {e}."));
+                }
+                self.echo_error = Some(e);
+            }
+        }
     }
 
     /// How CABLE Input is being played, while streams run.
@@ -597,6 +732,7 @@ impl Drop for Controller {
     fn drop(&mut self) {
         self.player = None;
         self.recording = None;
+        self.echo = None;
         self.streams = None;
         if let Some(w) = self.worker.take() {
             w.stop();

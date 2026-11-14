@@ -17,6 +17,7 @@ use gpui::{AssetSource, Result, SharedString};
 pub const MARK: &str = "icon/sotto-mark.svg";
 pub const MIC: &str = "icons/mic.svg";
 pub const PLUG: &str = "icons/plug.svg";
+pub const HEADPHONES: &str = "icons/headphones.svg";
 pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
 pub const CHEVRON_LEFT: &str = "icons/chevron-left.svg";
 pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
@@ -32,6 +33,10 @@ const FILES: &[(&str, &[u8])] = &[
     (MARK, include_bytes!("../../assets/icon/sotto-mark.svg")),
     (MIC, include_bytes!("../../assets/icons/mic.svg")),
     (PLUG, include_bytes!("../../assets/icons/plug.svg")),
+    (
+        HEADPHONES,
+        include_bytes!("../../assets/icons/headphones.svg"),
+    ),
     (
         CHEVRON_LEFT,
         include_bytes!("../../assets/icons/chevron-left.svg"),

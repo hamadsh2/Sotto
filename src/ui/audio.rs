@@ -26,7 +26,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cpal::DeviceId;
-use sotto::control::{Change, Chosen, Controller, EngineKind, Hear};
+use sotto::control::{Change, Chosen, Controller, EchoState, EngineKind, Hear};
 use sotto::devices::{self, Dir};
 use sotto::engine::OutputMode;
 use sotto::params::Params;
@@ -90,6 +90,10 @@ pub struct Status {
     pub hear_error: Option<String>,
     /// How CABLE Input is played while running (exclusive = hidden from screen shares).
     pub output_mode: Option<OutputMode>,
+    /// Headphones picked for echo removal, and the real playback devices to pick from.
+    pub headphones: Option<Device>,
+    pub headphone_list: Vec<Device>,
+    pub echo: Option<EchoState>,
 }
 
 pub enum Command {
@@ -110,6 +114,8 @@ pub enum Command {
     ForgetClip,
     /// "Hide my voice from screen shares" changed: reopen the streams with it.
     SetHide(bool),
+    /// "Remove headphone echo" changed: start or stop it now.
+    SetEcho(bool),
     Quit,
 }
 
@@ -128,6 +134,7 @@ pub struct Choice {
     pub output: Option<String>,
     pub saved_input: Option<SavedDevice>,
     pub saved_output: Option<SavedDevice>,
+    pub saved_headphones: Option<SavedDevice>,
     pub engine: EngineKind,
     /// A problem with the settings file, to show once.
     pub note: Option<String>,
@@ -212,6 +219,11 @@ fn initial_devices(ctl: &mut Controller, choice: &Choice) -> Option<String> {
         }
     } else if let Some(d) = &choice.saved_input
         && let Err(e) = ctl.restore(Dir::Input, &d.id, &d.name)
+    {
+        err = Some(e);
+    }
+    if let Some(d) = &choice.saved_headphones
+        && let Err(e) = ctl.restore(Dir::Headphones, &d.id, &d.name)
     {
         err = Some(e);
     }
@@ -337,6 +349,10 @@ fn control_loop(
                 publish_hear(&mut ctl, status, None);
                 next_tick = Instant::now(); // reopen right away
             }
+            Ok(Command::SetEcho(on)) => {
+                ctl.params.echo.store(on, Relaxed);
+                next_tick = Instant::now(); // start or stop right away
+            }
             Ok(Command::Quit) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -416,6 +432,8 @@ fn publish(ctl: &Controller, status: &Mutex<Status>, waiting_note: &mut String) 
         s.output = ctl.output().map(Device::from);
         s.latency_ms = running.then(|| ctl.engine_latency_ms() + buffer.unwrap_or(0.0) / 48.0);
         s.output_mode = ctl.output_mode().cloned();
+        s.headphones = ctl.headphones().map(Device::from);
+        s.echo = Some(ctl.echo_state());
         if s.loading.is_none() {
             s.engine = Some(ctl.engine_kind());
         }
@@ -430,6 +448,7 @@ fn refresh_lists(ctl: &Controller, status: &Mutex<Status>) {
             .map(|v| v.iter().map(Device::from).collect::<Vec<_>>())
     };
     let (inputs, outputs) = (list(Dir::Input), list(Dir::Output));
+    let phones = list(Dir::Headphones);
     let cable_is_default = ctl.cable_is_default();
     set(status, |s| {
         // Keep the old lists if Windows was busy changing them mid-read.
@@ -440,8 +459,12 @@ fn refresh_lists(ctl: &Controller, status: &Mutex<Status>) {
             s.cable_missing = v.is_empty();
             s.outputs = v;
         }
+        if let Ok(v) = phones {
+            s.headphone_list = v;
+        }
         s.cable_is_default = cable_is_default;
         s.input = ctl.input().map(Device::from);
         s.output = ctl.output().map(Device::from);
+        s.headphones = ctl.headphones().map(Device::from);
     });
 }

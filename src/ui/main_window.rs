@@ -33,7 +33,7 @@ use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::switch::Switch;
 use gpui_component::{Disableable, IndexPath, Sizable};
-use sotto::control::{EngineKind, Hear};
+use sotto::control::{EchoState, EngineKind, Hear};
 use sotto::devices::{Dir, VB_CABLE_URL};
 use sotto::engine::OutputMode;
 use sotto::params::{
@@ -216,8 +216,9 @@ pub struct MainWindow {
     eq: [Entity<SliderState>; 3],
     input_select: DeviceSelect,
     output_select: DeviceSelect,
+    headphones_select: DeviceSelect,
     /// What the pickers currently show, to update them only when something changed.
-    shown: [(Vec<Device>, Option<String>); 2],
+    shown: [(Vec<Device>, Option<String>); 3],
     /// The stage whose fine settings are open (one at a time).
     expanded: Option<Stage>,
     /// "Tune for my room" is open under its row.
@@ -337,7 +338,13 @@ impl MainWindow {
 
         let input_select = cx.new(|cx| SelectState::new(Vec::<Device>::new(), None, window, cx));
         let output_select = cx.new(|cx| SelectState::new(Vec::<Device>::new(), None, window, cx));
-        for (sel, dir) in [(&input_select, Dir::Input), (&output_select, Dir::Output)] {
+        let headphones_select =
+            cx.new(|cx| SelectState::new(Vec::<Device>::new(), None, window, cx));
+        for (sel, dir) in [
+            (&input_select, Dir::Input),
+            (&output_select, Dir::Output),
+            (&headphones_select, Dir::Headphones),
+        ] {
             subs.push(
                 cx.subscribe(sel, move |_, _, ev: &SelectEvent<Vec<Device>>, cx| {
                     if let SelectEvent::Confirm(Some(id)) = ev {
@@ -420,6 +427,7 @@ impl MainWindow {
             eq,
             input_select,
             output_select,
+            headphones_select,
             shown: Default::default(),
             expanded: None,
             tune_open: false,
@@ -773,6 +781,7 @@ impl MainWindow {
         let pairs = [
             (&self.input_select, &st.inputs, &st.input),
             (&self.output_select, &st.outputs, &st.output),
+            (&self.headphones_select, &st.headphone_list, &st.headphones),
         ];
         for (i, (sel, list, chosen)) in pairs.into_iter().enumerate() {
             let chosen_id = chosen.as_ref().map(|d| d.id.clone());
@@ -1534,6 +1543,71 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// "Remove headphone echo": AEC3 with a read-only loopback of the picked headphones
+    /// (see `echo.rs`), for open-back headphones that leak into the mic.
+    fn echo_row(&self, st: &Status, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.params.echo.load(Relaxed);
+        let removing = st
+            .stats
+            .as_ref()
+            .and_then(|s| s.echo_readings().0)
+            .filter(|db| *db >= 1.0);
+        let (hint, problem): (SharedString, Option<String>) = match (&st.echo, on) {
+            (_, false) => (
+                "For open-back headphones: removes what they leak into your mic.".into(),
+                None,
+            ),
+            _ if st.headphones.is_none() => ("Choose your headphones above.".into(), None),
+            (Some(EchoState::On(_)), true) => (
+                match removing {
+                    Some(db) => format!("On — removing about {db:.0} dB of echo.").into(),
+                    None => "On — listening to your headphones (never plays to them).".into(),
+                },
+                None,
+            ),
+            (Some(EchoState::Waiting(why)), true) => (
+                "Paused.".into(),
+                Some(format!("Echo removal is paused: {why}.")),
+            ),
+            _ => ("Starting…".into(), None),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(SP_8)
+            .py(SP_12)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(SP_12)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child("Remove headphone echo")
+                            .child(caption(hint)),
+                    )
+                    .child(
+                        div().flex_none().cursor_pointer().child(
+                            Switch::new("echo-removal")
+                                .checked(on)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    // Set here too, so the save right after sees it.
+                                    this.params.echo.store(*checked, Relaxed);
+                                    send(Command::SetEcho(*checked), cx);
+                                    save_soon(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+            .when_some(problem, |d, p| d.child(note(p)))
+            .into_any_element()
+    }
+
     /// "Check for updates automatically" (at start and once a day).
     fn auto_update_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let on = cx.global::<AppState>().settings.check_updates;
@@ -2224,6 +2298,15 @@ impl Render for MainWindow {
             )
             .into_any_element(),
             self.hide_row(&st, cx),
+            self.device_row(
+                assets::HEADPHONES,
+                "Headphones (for echo removal)",
+                &self.headphones_select,
+                "Choose your headphones",
+                st.headphone_list.is_empty(),
+            )
+            .into_any_element(),
+            self.echo_row(&st, cx),
         ];
         let readout = |label: &'static str, value: String| {
             div()

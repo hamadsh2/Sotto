@@ -7,7 +7,7 @@
 //! *atomic* integer, which the CPU updates indivisibly — no lock, so the audio thread
 //! can never be blocked waiting for the main thread.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 /// Histogram bucket width for per-frame processing time.
@@ -75,6 +75,12 @@ pub struct Stats {
     pub speech_frames: AtomicU64,
     /// The auto gain's measured voice level before its gain, dB, as f32 bits.
     pub voice_db: AtomicU32,
+    /// The headphones loopback (echo reference) stream failed.
+    pub echo_failed: AtomicBool,
+    /// Echo removed right now (AEC3's ERLE) in hundredths of a dB, and its
+    /// headphones → mic delay in ms; `i32::MIN` = not known / echo removal off.
+    pub echo_erle_cdb: AtomicI32,
+    pub echo_delay_ms: AtomicI32,
     /// "Tune for my room" is measuring: the worker fills the histograms below.
     tuning: AtomicBool,
     /// While tuning, frames whose gate-detector level is at least this (dB, f32 bits)
@@ -120,11 +126,34 @@ impl Stats {
             clip_frames: AtomicU64::new(0),
             speech_frames: AtomicU64::new(0),
             voice_db: AtomicU32::new(crate::dsp::AGC_TARGET_DB.to_bits()),
+            echo_failed: AtomicBool::new(false),
+            echo_erle_cdb: AtomicI32::new(i32::MIN),
+            echo_delay_ms: AtomicI32::new(i32::MIN),
             tuning: AtomicBool::new(false),
             tune_voice_min_db: AtomicU32::new(0f32.to_bits()),
             tune_level: (0..TUNE_BINS).map(|_| AtomicU32::new(0)).collect(),
             tune_voice: (0..TUNE_BINS).map(|_| AtomicU32::new(0)).collect(),
         }
+    }
+
+    /// Worker: publish echo removal's readings (`None` = off). Atomics only.
+    pub fn echo_publish(&self, r: Option<(Option<f64>, Option<i32>)>) {
+        let (erle, delay) = r.unwrap_or((None, None));
+        let erle = erle
+            .filter(|e| e.is_finite())
+            .map_or(i32::MIN, |e| (e * 100.0).clamp(-1e6, 1e6) as i32);
+        self.echo_erle_cdb.store(erle, Relaxed);
+        self.echo_delay_ms.store(delay.unwrap_or(i32::MIN), Relaxed);
+    }
+
+    /// Echo removal's (ERLE dB, delay ms), each when known.
+    pub fn echo_readings(&self) -> (Option<f32>, Option<i32>) {
+        let e = self.echo_erle_cdb.load(Relaxed);
+        let d = self.echo_delay_ms.load(Relaxed);
+        (
+            (e != i32::MIN).then(|| e as f32 / 100.0),
+            (d != i32::MIN).then_some(d),
+        )
     }
 
     /// Called from the audio thread once per frame. Real-time safe (atomics only).

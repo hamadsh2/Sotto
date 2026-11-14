@@ -39,8 +39,8 @@ Repo: github.com/hamadsh2/Sotto (public). License: GPL-3.0-only.
 
 ## Audio isolation rules (STRICT — never violate)
 - The app streams on exactly **two devices**: the selected input mic and the selected
-  output (VB-Cable "CABLE Input"). Nothing else — except the one clip-playback
-  exception below.
+  output (VB-Cable "CABLE Input"). Nothing else — except the clip-playback and
+  echo-reference exceptions below.
 - Never open a *live* stream on the user's headphones, speakers, or DAC. No live
   monitoring / "listen to yourself while talking" of any kind (it doubles your voice in
   screen shares and recordings).
@@ -51,6 +51,14 @@ Repo: github.com/hamadsh2/Sotto (public). License: GPL-3.0-only.
   selected Sotto output. The device is the Windows default playback device, resolved to
   its endpoint ID at the moment of the click; shared mode; no setting is changed. The clip
   is never written to disk.
+- **Echo-reference exception ("Echo removal", user-approved 2026-11-14):** for open-back
+  headphones, Sotto may open a **read-only WASAPI loopback capture** of the headphones
+  device the user explicitly picked for echo removal (matched by its endpoint ID), shared
+  mode, used only as the echo reference. Nothing is ever rendered to that device, no
+  setting of it is changed, the reference is never stored, recorded, or sent anywhere.
+  Off by default (until the user picks a device); never a VB-Audio / Voicemeeter / CABLE
+  device or the selected Sotto output; if the device disappears, echo removal stops and
+  reports — never falls back to another device.
 - Never change Windows default playback or recording devices; never modify any system
   audio setting (volume, format, enhancements, exclusive-mode flags, etc.).
 - **WASAPI shared mode** for every stream, so other apps can still use the mic — with one
@@ -70,8 +78,8 @@ Repo: github.com/hamadsh2/Sotto (public). License: GPL-3.0-only.
     Never call `default_output_device()` to obtain a device to open a stream on —
     except to resolve the clip-playback device above (then opened by its exact ID).
     Reading the default device *only to compare* (for the warning above) is allowed.
-  - Enumerating devices is fine; opening a stream is not, except on the two chosen ones
-    and the clip-playback exception.
+  - Enumerating devices is fine; opening a stream is not, except on the two chosen ones,
+    the clip-playback exception, and the echo-reference loopback capture.
   - If the selected output is missing, stop output and report — never fall back to
     another device.
 
@@ -80,6 +88,8 @@ Only these crates without asking:
 - Audio: `cpal` (WASAPI backend), `ringbuf` (lock-free SPSC between input/output threads),
   `windows` 0.62 (same version cpal uses; only for the exclusive CABLE Input renderer,
   user-approved 2026-11-14)
+- Echo removal: `sonora` (pure-Rust WebRTC audio processing, BSD-3-Clause; only its AEC3
+  echo canceller is enabled; user-approved 2026-11-14)
 - Denoise: `nnnoiseless` (RNNoise port), DeepFilterNet Rust implementation (`deep_filter`
   / libDF — license and model terms must be verified before bundling)
 - UI: `gpui`, `gpui-component`, `global-hotkey`, `tray-icon`
@@ -107,8 +117,11 @@ codegen-units = 1
   Use `Result` everywhere on device paths; no `unwrap()` there.
 
 ## Processing chain (exact order)
-`High-pass (~80 Hz) → Denoise engine → EQ → Noise gate → Auto gain + limiter → output`
+`High-pass (~80 Hz) → Echo removal → Denoise engine → EQ → Noise gate → Auto gain + limiter → output`
 - Every stage is independently toggleable.
+- Echo removal (user-approved 2026-11-14): WebRTC AEC3 via `sonora`, reference = loopback
+  of the user-picked headphones (see the echo-reference exception), resampled to 48 kHz
+  mono. Before denoise, so the denoiser cleans what AEC3 leaves. Off by default.
 - EQ (added Phase 2c, user-approved): 3 bands — body (low shelf ~150 Hz), mud (peak
   ~350 Hz), presence (peak ~4 kHz); presets Natural (flat, default) / Warm / Clear /
   Broadcast at ±3 dB max, plus Custom (±6 dB per band, user-adjustable). After denoise

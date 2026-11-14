@@ -31,10 +31,20 @@ pub struct Named {
     pub device: Device,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dir {
     Input,
     Output,
+    /// The user's headphones, picked for echo removal: Sotto only ever opens a
+    /// read-only loopback capture on it (see `echo.rs`), never plays anything there.
+    Headphones,
+}
+
+/// Anything that could be a virtual microphone (VB-Cable, Voicemeeter, …). Never a
+/// "Hear yourself" target, never an echo-removal headphones device.
+pub fn is_virtual(name: &str) -> bool {
+    let n = name.to_lowercase();
+    is_vb_cable(name) || n.contains("vb-audio") || n.contains("voicemeeter") || n.contains("cable")
 }
 
 /// True only for VB-Cable endpoints: "CABLE Input (VB-Audio Virtual Cable)",
@@ -57,7 +67,9 @@ pub fn list(host: &Host, dir: Dir) -> Result<Vec<Named>, String> {
     no_panic("listing devices", || {
         let devices: Vec<Device> = match dir {
             Dir::Input => host.input_devices().map_err(|e| e.to_string())?.collect(),
-            Dir::Output => host.output_devices().map_err(|e| e.to_string())?.collect(),
+            Dir::Output | Dir::Headphones => {
+                host.output_devices().map_err(|e| e.to_string())?.collect()
+            }
         };
         Ok(devices
             .into_iter()
@@ -104,13 +116,23 @@ fn pick(mut devices: Vec<Named>, query: &str, kind: &str) -> Result<Named, Strin
     }
 }
 
-/// What the user may pick: microphones (never VB-Cable's own "CABLE Output"), or
-/// VB-Cable render endpoints only. Listing opens nothing.
+/// What the user may pick: microphones (never VB-Cable's own "CABLE Output"),
+/// VB-Cable render endpoints only, or (for echo removal) real playback devices only —
+/// never a virtual one. Listing opens nothing.
 pub fn choices(host: &Host, dir: Dir) -> Result<Vec<Named>, String> {
     Ok(list(host, dir)?
         .into_iter()
-        .filter(|d| is_vb_cable(&d.name) == (dir == Dir::Output))
+        .filter(|d| match dir {
+            Dir::Input => !is_vb_cable(&d.name),
+            Dir::Output => is_vb_cable(&d.name),
+            Dir::Headphones => !is_virtual(&d.name),
+        })
         .collect())
+}
+
+/// Headphones for echo removal, by name (never a virtual device).
+pub fn find_headphones(host: &Host, query: &str) -> Result<Named, String> {
+    pick(choices(host, Dir::Headphones)?, query, "headphones")
 }
 
 pub fn find_input(host: &Host, query: &str) -> Result<Named, String> {
@@ -203,6 +225,10 @@ pub fn print_list(host: &Host) -> Result<(), String> {
         println!("  none — install VB-Cable: {VB_CABLE_URL}");
     }
     for d in cables {
+        println!("  {}", d.name);
+    }
+    println!("\nHeadphones for echo removal (only listened to, never played to):");
+    for d in choices(host, Dir::Headphones)? {
         println!("  {}", d.name);
     }
     Ok(())

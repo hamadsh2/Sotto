@@ -5,7 +5,8 @@
 //!  mic ─(cpal capture thread)─► downmix to mono ─► raw ring ─┐
 //!                                                            ▼
 //!          Sotto's denoise worker thread: 480-sample frame → processing chain
-//!          (high-pass → denoise → gate → auto gain → limiter, see `dsp.rs`)
+//!          (high-pass → echo removal → denoise → EQ → gate → auto gain → limiter,
+//!          see `dsp.rs`; echo removal takes a reference from `echo.rs`)
 //!                                                            │
 //!  CABLE Input ◄─(render thread)─ pull samples ◄─ clean ring
 //! ```
@@ -40,6 +41,7 @@ use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 use crate::denoise::FRAME;
 use crate::dsp::{Chain, EngineSlot};
+use crate::echo::{self, EchoRef, LoopbackTap};
 use crate::params::Params;
 use crate::stats::Stats;
 
@@ -81,6 +83,9 @@ enum WorkerMsg {
     Record(HeapProd<f32>),
     /// Stop recording early; the ring comes back on `recorded`.
     StopRecord,
+    /// Start (Some) or stop (None) echo removal; the old one comes back on
+    /// `retired_echo`.
+    Echo(Option<Box<EchoRef>>),
     Quit,
 }
 
@@ -94,6 +99,8 @@ pub struct Worker {
     /// Recording rings come back here when full or stopped, so they are freed on the
     /// main thread too.
     pub recorded: mpsc::Receiver<HeapProd<f32>>,
+    /// Echo cancellers the worker no longer uses (freed on the main thread).
+    pub retired_echo: mpsc::Receiver<Box<EchoRef>>,
 }
 
 #[link(name = "kernel32")]
@@ -114,6 +121,7 @@ impl Worker {
         let (tx, rx) = mpsc::channel::<WorkerMsg>();
         let (ret_tx, retired) = mpsc::channel::<EngineSlot>();
         let (rec_tx, recorded) = mpsc::channel::<HeapProd<f32>>();
+        let (echo_tx, retired_echo) = mpsc::channel::<Box<EchoRef>>();
         let thread = thread::Builder::new()
             .name("sotto-denoise".into())
             .spawn(move || {
@@ -183,6 +191,13 @@ impl Worker {
                             }
                             continue;
                         }
+                        Ok(WorkerMsg::Echo(e)) => {
+                            if let Some(old) = chain.set_echo(e) {
+                                let _ = echo_tx.send(old);
+                            }
+                            stats.echo_publish(None);
+                            continue;
+                        }
                         Ok(WorkerMsg::Quit) | Err(mpsc::TryRecvError::Disconnected) => return,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
@@ -194,6 +209,9 @@ impl Worker {
                             stats.record_frame(t0.elapsed());
                             stats.record_chain(&info);
                             stats.record_levels(&frame, &clean);
+                            if let Some(e) = chain.echo() {
+                                stats.echo_publish(Some((e.erle_db(), e.delay_ms())));
+                            }
                             last_frame = Some(t0);
                             if let Some(old) = chain.take_retired() {
                                 give_back(old);
@@ -235,6 +253,7 @@ impl Worker {
             thread,
             retired,
             recorded,
+            retired_echo,
         })
     }
 
@@ -246,6 +265,13 @@ impl Worker {
             .map_err(|_| "denoise thread is not running".to_string())?;
         self.thread.thread().unpark();
         Ok(())
+    }
+
+    /// Hand echo removal to the worker (`None` stops it).
+    pub fn set_echo(&self, e: Option<Box<EchoRef>>) -> Result<(), String> {
+        self.tx
+            .send(WorkerMsg::Echo(e))
+            .map_err(|_| "denoise thread is not running".to_string())
     }
 
     /// Start copying the output into `ring` (see `WorkerMsg::Record`).
@@ -476,6 +502,71 @@ pub fn start(
 }
 
 const TIMEOUT: Option<Duration> = Some(Duration::from_secs(3));
+
+// ---------------------------------------------------------------------------
+// Echo reference: read-only loopback capture of the user-picked headphones
+// ---------------------------------------------------------------------------
+
+/// A running loopback capture of the headphones (dropping it stops it).
+pub struct EchoStream {
+    _stream: Stream,
+    /// e.g. "2ch 44.1 kHz", for messages.
+    pub format: String,
+}
+
+/// Start a **read-only loopback capture** of `headphones` (cpal opens a WASAPI loopback
+/// stream when an input stream is built on a render device) and hand the matching echo
+/// canceller to `worker`. Shared mode, the device's own mix format: nothing is ever
+/// played to the device and none of its settings change.
+///
+/// `headphones` must be the device the user picked for echo removal, found by its
+/// endpoint ID in `devices` (never a default device, never a VB-Cable/Voicemeeter one).
+pub fn start_echo(
+    headphones: &Device,
+    worker: &Worker,
+    stats: Arc<Stats>,
+) -> Result<EchoStream, String> {
+    let cfg = headphones
+        .default_output_config()
+        .map_err(|e| format!("couldn't read the headphones' format: {e}"))?;
+    if cfg.sample_format() != SampleFormat::F32 {
+        return Err(format!(
+            "the headphones use {:?} audio, which echo removal can't read",
+            cfg.sample_format()
+        ));
+    }
+    let rate = cfg.sample_rate();
+    let ch = cfg.channels() as usize;
+    let (prod, cons) = HeapRb::<f32>::new(echo::ring_capacity(rate)).split();
+    // Built here on the main thread (AEC3 allocates its state once, now).
+    let aec = EchoRef::new(cons, rate)?;
+    let mut tap = LoopbackTap::new(prod, ch);
+    let on_data = move |data: &[f32], _: &cpal::InputCallbackInfo| tap.push(data);
+    let st = Arc::clone(&stats);
+    let on_err = move |e: cpal::Error| {
+        if !is_recoverable(e.kind()) {
+            st.echo_failed.store(true, Relaxed);
+        }
+    };
+    let config = StreamConfig {
+        channels: cfg.channels(),
+        sample_rate: rate,
+        buffer_size: cpal::BufferSize::Default,
+    };
+    stats.echo_failed.store(false, Relaxed);
+    let stream = headphones
+        .build_input_stream::<f32, _, _>(config, on_data, on_err, TIMEOUT)
+        .map_err(|e| format!("couldn't listen to the headphones: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("couldn't listen to the headphones: {e}"))?;
+    worker.set_echo(Some(Box::new(aec)))?;
+    let khz = rate as f64 / 1000.0;
+    Ok(EchoStream {
+        _stream: stream,
+        format: format!("{ch}ch {khz} kHz"),
+    })
+}
 
 /// Render-side state: how much audio to keep queued, and whether we are playing yet.
 ///

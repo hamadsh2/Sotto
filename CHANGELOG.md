@@ -4,6 +4,14 @@ All notable changes to Sotto. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+### Added
+- **Remove headphone echo** (off by default): for open-back headphones, which leak what you
+  hear (game, friends, music) into your mic. Pick your headphones and Sotto subtracts that
+  leak with WebRTC's AEC3 echo canceller, before noise removal. Sotto only *listens* to what
+  Windows plays to those headphones (a read-only loopback); it never plays anything to them,
+  never changes their settings, and keeps nothing. Your headphones stay on your own DAC or
+  sound card, untouched.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added

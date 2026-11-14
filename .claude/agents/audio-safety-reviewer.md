@@ -27,6 +27,14 @@ break their system audio.
   moment (then opened by that ID), shared mode, stream closed when the clip ends. Never
   while recording, never automatic or looping, never to a VB-Audio / Voicemeeter /
   CABLE device or to Sotto's selected output, never written to disk.
+- Second exception (user-approved 2026-11-14), "Echo removal" reference: a read-only
+  WASAPI **loopback capture** (cpal `build_input_stream` on an output device) of the
+  headphones device the user explicitly picked for echo removal, matched by endpoint ID,
+  shared mode. Nothing rendered to it; no setting changed; the reference is never stored,
+  recorded, or sent; never a VB-Audio / Voicemeeter / CABLE device or Sotto's selected
+  output; off until the user picks a device; device gone → echo removal stops, never a
+  fallback to another (e.g. the default) device. Any loopback capture outside this is a
+  BLOCKER, as is any *render* stream on that headphones device.
 - Never change Windows default playback/recording devices or any system audio setting.
 - WASAPI shared mode only — never exclusive. **Exception (user-approved 2026-11-14):** the
   output to the selected VB-Cable "CABLE Input" may be exclusive (hides the voice from
@@ -80,7 +88,8 @@ break their system audio.
 Allowed (do not flag): enumerating devices; reading the default playback device
 *only* to compare it with CABLE Input for the warning; opening streams on the two
 explicitly selected devices in shared mode; the exclusive-mode renderer on the selected
-CABLE Input (by its endpoint ID) with fallback to shared.
+CABLE Input (by its endpoint ID) with fallback to shared; the read-only echo-reference
+loopback capture on the user-picked headphones (by its endpoint ID) as described above.
 
 ## Output format
 Start with a one-line verdict: `PASS`, `PASS WITH NOTES`, or `FAIL`.

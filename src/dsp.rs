@@ -516,6 +516,8 @@ pub struct Chain {
     gate: Gate,
     agc: Agc,
     lim: Limiter,
+    /// Echo removal (AEC3 + headphones reference), when on. See `echo.rs`.
+    echo: Option<Box<crate::echo::EchoRef>>,
     engine: EngineSlot,
     switch: Option<Switch>,
     /// The engine replaced by the last finished switch, waiting to be handed back to
@@ -551,6 +553,7 @@ impl Chain {
             gate: Gate::new(p.gate_threshold_db()),
             agc: Agc::new(),
             lim: Limiter::new(),
+            echo: None,
             engine,
             switch: None,
             retired: None,
@@ -601,6 +604,18 @@ impl Chain {
 
     pub fn is_switching(&self) -> bool {
         self.switch.is_some()
+    }
+
+    /// Start or stop echo removal; returns the previous one (to free off the audio path).
+    pub fn set_echo(
+        &mut self,
+        e: Option<Box<crate::echo::EchoRef>>,
+    ) -> Option<Box<crate::echo::EchoRef>> {
+        std::mem::replace(&mut self.echo, e)
+    }
+
+    pub fn echo(&self) -> Option<&crate::echo::EchoRef> {
+        self.echo.as_deref()
     }
 
     /// The engine replaced by a finished switch, if any.
@@ -655,6 +670,12 @@ impl Chain {
             };
             let f = self.hpf.process(x);
             *y = x + (f - x) * self.hpf_amt.next(hpf_on);
+        }
+
+        // 1b. Echo removal: subtract what the headphones leaked into the mic, before the
+        // denoiser (which then cleans whatever AEC3 leaves).
+        if let Some(e) = self.echo.as_mut() {
+            e.process(&mut self.a);
         }
 
         // 2. Denoise → self.b, mixed with the (delay-matched) dry signal by strength.

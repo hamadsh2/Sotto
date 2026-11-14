@@ -66,13 +66,17 @@ delete that folder to remove them too.
 
 ## Your audio stays yours
 
-Sotto streams on exactly **two** devices: the microphone you choose and VB-Cable's **CABLE Input**.
+Sotto carries your voice through exactly **two** devices: the microphone you choose and VB-Cable's **CABLE Input**.
 
 - It **never streams live to your headphones, speakers or DAC**, so your voice is never doubled
   in a screen share or recording. The one exception is **Hear yourself**: when you click Play,
   it plays a 5-second clip of your cleaned voice you just recorded, once, on your default
   playback device, then closes it. The clip stays in memory and is never sent to a virtual
   cable, Voicemeeter or Sotto's own output.
+- **Remove headphone echo** (off by default, for open-back headphones): Sotto *listens* to
+  the headphones you pick, read-only, to know what they're playing and subtract the part
+  that leaks into your mic. It never plays anything to them, never changes their settings,
+  and keeps nothing it hears. If they're unplugged, echo removal pauses until they're back.
 - It **never changes Windows sound settings**: not your default devices, volume, formats or enhancements.
 - Your **mic is opened in shared mode**, so other apps can still use it.
 - **Hide my voice from screen shares** (on by default): Sotto plays into CABLE Input in

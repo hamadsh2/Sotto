@@ -33,13 +33,7 @@ pub const CLIP_SAMPLES: usize = SAMPLE_RATE as usize * CLIP_SECONDS;
 const FADE_SAMPLES: usize = SAMPLE_RATE as usize / 100; // 10 ms
 
 /// Devices the clip must never go to: anything that could be a virtual microphone.
-pub fn is_virtual(name: &str) -> bool {
-    let n = name.to_lowercase();
-    devices::is_vb_cable(name)
-        || n.contains("vb-audio")
-        || n.contains("voicemeeter")
-        || n.contains("cable")
-}
+pub use crate::devices::is_virtual;
 
 /// Windows' default playback device right now, found again in the enumerated list by
 /// its exact endpoint ID (so the handle is fixed to that device). Refuses virtual

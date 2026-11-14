@@ -27,6 +27,8 @@ OPTIONS:
   --list            Show microphones and VB-Cable outputs, then exit
   --input NAME      Microphone to clean (full name or a unique part of it)
   --output NAME     VB-Cable output (default: \"CABLE Input\"). Only VB-Audio devices are allowed.
+  --headphones NAME Your headphones, for echo removal (turns it on). Sotto only listens
+                    to what plays there (read-only loopback); it never plays to them.
   --engine NAME     rnnoise (default, \"Light — for gaming\"),
                     dfn (DeepFilterNet, \"High quality — for recording & calls\"),
                     or off (passthrough)
@@ -56,6 +58,7 @@ Commands (type, then Enter):
   record             record 5 s of your cleaned voice (into memory only)
   play               play that clip once on your Windows playback device
   hide on|off        hide your voice from screen shares (exclusive CABLE Input)
+  echo on|off        remove headphone echo (needs --headphones)
   status             show current settings
   stats              show the latest performance line
   report on|off      print that line every second (off = easier typing)
@@ -104,6 +107,7 @@ fn handle_command(line: &str, p: &Params) -> Cmd {
         ["tune", "apply"] => return Cmd::TuneApply,
         ["record"] => return Cmd::Record,
         ["play"] => return Cmd::Play,
+        ["echo", v] => toggle("echo", &p.echo, v),
         ["hide", "on"] => return Cmd::Hide(true),
         ["hide", "off"] => return Cmd::Hide(false),
         ["hpf", v] => toggle("hpf", &p.hpf, v),
@@ -192,6 +196,7 @@ struct Args {
     list: bool,
     input: Option<String>,
     output: Option<String>,
+    headphones: Option<String>,
     engine: EngineKind,
     seconds: Option<u64>,
     quiet: bool,
@@ -203,6 +208,7 @@ fn parse_args() -> Result<Args, String> {
         list: false,
         input: None,
         output: None,
+        headphones: None,
         engine: EngineKind::Rnnoise,
         seconds: None,
         quiet: false,
@@ -214,6 +220,7 @@ fn parse_args() -> Result<Args, String> {
             "--list" => a.list = true,
             "--input" => a.input = Some(value()?),
             "--output" => a.output = Some(value()?),
+            "--headphones" => a.headphones = Some(value()?),
             "--engine" => {
                 let v = value()?;
                 a.engine = EngineKind::parse(&v)
@@ -281,6 +288,12 @@ fn run() -> Result<(), String> {
     }
     println!("Input : {}", ctl.input_name());
     println!("Output: {}", ctl.output_name());
+    if let Some(q) = args.headphones.as_deref() {
+        let hp = devices::find_headphones(&cpal::default_host(), q)?;
+        ctl.select(devices::Dir::Headphones, &hp.id)?;
+        ctl.params.echo.store(true, Relaxed);
+        println!("Echo  : {} (listened to only, never played to)", hp.name);
+    }
     println!("Engine: {} ({})", args.engine.name(), args.engine.label());
 
     // Typed commands. A separate thread blocks reading lines and sends each one on the
@@ -527,11 +540,20 @@ fn run() -> Result<(), String> {
                 Some((ppm, se)) if drift.points() >= 30 => format!("{ppm:+6.1} ±{se:.1} ppm"),
                 _ => "  (measuring)".into(),
             };
+            let echo_txt = match (ctl.echo_state(), st.echo_readings()) {
+                (sotto::control::EchoState::On(_), (erle, delay)) => format!(
+                    " | echo removed {} delay {}",
+                    erle.map_or("—".into(), |e| format!("{e:.1} dB")),
+                    delay.map_or("—".into(), |d| format!("{d} ms"))
+                ),
+                (sotto::control::EchoState::Waiting(_), _) => " | echo waiting".into(),
+                _ => String::new(),
+            };
             last_report = format!(
                 "{:<7} | frames {:>3} | proc p50 {:>5.3} ms  p99 {:>5.3} ms  max {:>6.3} ms | \
                  CPU {:>5.2}% | RAM {:>5.1} MB (private {:>5.1}) | buffer avg {:>4.1} ms | \
                  gate open {gate_pct:>3.0}% | agc {agc_db:+5.1} dB | limit {limit_db:>4.1} dB | \
-                 drift {drift_txt} | overflow {} underrun {} resync {} | engine errors {}",
+                 drift {drift_txt} | overflow {} underrun {} resync {} | engine errors {}{echo_txt}",
                 // The engine actually heard right now (published by the worker).
                 match st.active_engine.load(Relaxed) {
                     1 => "rnnoise",

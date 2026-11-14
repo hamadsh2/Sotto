@@ -31,6 +31,9 @@ pub struct Params {
     /// "Hide my voice from screen shares": play CABLE Input in exclusive mode (see
     /// `exclusive.rs`). Read when streams open; changing it reopens them.
     pub hide_from_share: AtomicBool,
+    /// "Remove headphone echo": read by the controller each tick; echo removal runs
+    /// only while this is on and headphones are picked (see `echo.rs`). Off by default.
+    pub echo: AtomicBool,
     /// EQ band gains in dB: body, mud, presence (f32 bits).
     eq_gains: [AtomicU32; 3],
     /// Which preset those gains came from (`EqPreset as u8`), for display.
@@ -132,6 +135,7 @@ impl Params {
             dfn_postfilter: AtomicBool::new(false),
             eq: AtomicBool::new(true),
             hide_from_share: AtomicBool::new(true),
+            echo: AtomicBool::new(false),
             eq_gains: [const { AtomicU32::new(0) }; 3], // 0u32 is 0.0f32: Natural
             eq_preset: AtomicU8::new(EqPreset::Natural as u8),
         }

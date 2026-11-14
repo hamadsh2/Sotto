@@ -154,6 +154,7 @@ pub fn run() {
         output: args.output,
         saved_input: s.input.clone(),
         saved_output: s.output.clone(),
+        saved_headphones: s.headphones.clone(),
         engine: args.engine.unwrap_or(s.engine()),
         note: loaded.note,
     };
@@ -380,6 +381,9 @@ fn save_now(cx: &mut App) {
         }
         if let Some(d) = &s.output {
             st.settings.output = Some(saved(d));
+        }
+        if let Some(d) = &s.headphones {
+            st.settings.headphones = Some(saved(d));
         }
         if let Some(e) = s.engine {
             st.settings.engine = e.name().into();

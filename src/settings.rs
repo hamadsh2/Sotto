@@ -38,6 +38,10 @@ pub struct SavedDevice {
 pub struct Settings {
     pub input: Option<SavedDevice>,
     pub output: Option<SavedDevice>,
+    /// Headphones picked for echo removal (only ever listened to, read-only).
+    pub headphones: Option<SavedDevice>,
+    /// "Remove headphone echo". Off by default.
+    pub echo: bool,
     /// "rnnoise", "deepfilternet" or "off".
     pub engine: String,
     /// 0..=1.
@@ -69,6 +73,8 @@ impl Default for Settings {
         let mut s = Self {
             input: None,
             output: None,
+            headphones: None,
+            echo: false,
             engine: EngineKind::Rnnoise.name().into(),
             strength: 0.0,
             hpf: false,
@@ -123,6 +129,7 @@ impl Settings {
         self.limiter = p.limiter.load(Relaxed);
         self.dfn_postfilter = p.dfn_postfilter.load(Relaxed);
         self.hide_from_share = p.hide_from_share.load(Relaxed);
+        self.echo = p.echo.load(Relaxed);
     }
 
     /// Put the saved values into `p`, through the clamping setters.
@@ -141,6 +148,7 @@ impl Settings {
         p.limiter.store(self.limiter, Relaxed);
         p.dfn_postfilter.store(self.dfn_postfilter, Relaxed);
         p.hide_from_share.store(self.hide_from_share, Relaxed);
+        p.echo.store(self.echo, Relaxed);
     }
 
     /// Parse TOML and clamp every value into its valid range.
@@ -254,6 +262,7 @@ mod tests {
         assert_eq!(s.mute_hotkey, MUTE_HOTKEY_DEFAULT);
         assert!(s.check_updates);
         assert!(s.input.is_none() && s.output.is_none());
+        assert!(s.headphones.is_none() && !s.echo);
     }
 
     #[test]
@@ -274,6 +283,11 @@ mod tests {
             limiter: false,
             dfn_postfilter: true,
             hide_from_share: false,
+            headphones: Some(SavedDevice {
+                id: "wasapi:{0.0.0.00000000}.{def}".into(),
+                name: "Speakers (TOPPING DX3 Pro)".into(),
+            }),
+            echo: true,
             start_with_windows: true,
             mute_hotkey: "Shift+F9".into(),
             check_updates: false,
