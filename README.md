@@ -74,7 +74,13 @@ Sotto streams on exactly **two** devices: the microphone you choose and VB-Cable
   playback device, then closes it. The clip stays in memory and is never sent to a virtual
   cable, Voicemeeter or Sotto's own output.
 - It **never changes Windows sound settings**: not your default devices, volume, formats or enhancements.
-- It uses WASAPI **shared mode** only, so other apps can still use your mic.
+- Your **mic is opened in shared mode**, so other apps can still use it.
+- **Hide my voice from screen shares** (on by default): Sotto plays into CABLE Input in
+  WASAPI *exclusive* mode. A whole-screen share in Discord records every app's sound,
+  which used to include your voice on its way to the cable, so viewers heard you twice.
+  Exclusive mode skips the Windows mixer the share listens to, so they hear you once.
+  While it's on, no other app can play into CABLE Input. If another app already holds
+  the cable exclusively, Sotto waits for it.
 - It creates no virtual devices, and never switches to another device: if one you chose is unplugged, it waits.
 - **No telemetry.** The only network use is the update check against this repository's releases.
 

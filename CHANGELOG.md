@@ -11,7 +11,12 @@ All notable changes to Sotto. Versions follow [Semantic Versioning](https://semv
 - **Hear yourself:** record 5 seconds of your cleaned voice, then play it back once in your
   headphones. It's never live, so your voice is never doubled in a screen share or recording
   while you talk. The clip stays in memory only and is never played to a virtual cable.
-- `sotto-cli`: `tune`, `tune apply`, `record` and `play` commands.
+- **Hide my voice from screen shares** (on by default): your voice no longer plays twice
+  for viewers of a Discord whole-screen share. Sotto now writes to CABLE Input in WASAPI
+  exclusive mode, which the per-app audio capture used by whole-screen shares can't see
+  (measured: none of it reaches that capture, all of it reaches CABLE Output); turn it off to go back to
+  shared mode (for example if you play a soundboard into CABLE Input).
+- `sotto-cli`: `tune`, `tune apply`, `record`, `play` and `hide on|off` commands.
 
 ### Changed
 - Auto gain aims for a slightly quieter level (−23 dB instead of −20 dB).

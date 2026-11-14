@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use cpal::DeviceId;
 use sotto::control::{Change, Chosen, Controller, EngineKind, Hear};
 use sotto::devices::{self, Dir};
+use sotto::engine::OutputMode;
 use sotto::params::Params;
 use sotto::settings::SavedDevice;
 use sotto::stats::Stats;
@@ -87,6 +88,8 @@ pub struct Status {
     pub hear: Hear,
     pub hear_progress: f32,
     pub hear_error: Option<String>,
+    /// How CABLE Input is played while running (exclusive = hidden from screen shares).
+    pub output_mode: Option<OutputMode>,
 }
 
 pub enum Command {
@@ -105,6 +108,8 @@ pub enum Command {
     StopHear,
     /// Stop and drop the clip (the window was hidden).
     ForgetClip,
+    /// "Hide my voice from screen shares" changed: reopen the streams with it.
+    SetHide(bool),
     Quit,
 }
 
@@ -326,6 +331,12 @@ fn control_loop(
                 ctl.forget_clip();
                 publish_hear(&mut ctl, status, Some(Ok(())));
             }
+            Ok(Command::SetHide(on)) => {
+                ctl.params.hide_from_share.store(on, Relaxed);
+                ctl.reopen();
+                publish_hear(&mut ctl, status, None);
+                next_tick = Instant::now(); // reopen right away
+            }
             Ok(Command::Quit) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -404,6 +415,7 @@ fn publish(ctl: &Controller, status: &Mutex<Status>, waiting_note: &mut String) 
         s.input = ctl.input().map(Device::from);
         s.output = ctl.output().map(Device::from);
         s.latency_ms = running.then(|| ctl.engine_latency_ms() + buffer.unwrap_or(0.0) / 48.0);
+        s.output_mode = ctl.output_mode().cloned();
         if s.loading.is_none() {
             s.engine = Some(ctl.engine_kind());
         }

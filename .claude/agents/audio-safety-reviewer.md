@@ -28,7 +28,10 @@ break their system audio.
   while recording, never automatic or looping, never to a VB-Audio / Voicemeeter /
   CABLE device or to Sotto's selected output, never written to disk.
 - Never change Windows default playback/recording devices or any system audio setting.
-- WASAPI shared mode only — never exclusive.
+- WASAPI shared mode only — never exclusive. **Exception (user-approved 2026-11-14):** the
+  output to the selected VB-Cable "CABLE Input" may be exclusive (hides the voice from
+  screen-share loopback capture), opened by the selected device's exact endpoint ID, with
+  an immediate fallback to shared mode if it fails. Exclusive anywhere else is a BLOCKER.
 - The app creates no virtual audio devices.
 - If CABLE Input is the default playback device: warn only, never change it.
 
@@ -50,9 +53,10 @@ break their system audio.
   `IMMDeviceEnumerator` write paths, registry writes under
   `HKLM/HKCU\...\MMDevices`, `nircmd`, `SoundVolumeView`, PowerShell `AudioDeviceCmdlets`,
   `Set-AudioDevice`, `mmsys.cpl` automation, or spawning any process that changes audio.
-- **Exclusive mode:** `AUDCLNT_SHAREMODE_EXCLUSIVE`, any `ShareMode::Exclusive`, cpal
-  features/forks enabling exclusive mode, direct `IAudioClient::Initialize` with
-  exclusive flags, or changing the device's default format.
+- **Exclusive mode** outside the allowed CABLE Input renderer: `AUDCLNT_SHAREMODE_EXCLUSIVE`,
+  any `ShareMode::Exclusive`, cpal features/forks enabling exclusive mode, direct
+  `IAudioClient::Initialize` with exclusive flags on any device other than the selected
+  CABLE Input, or changing any device's default format / exclusive-control setting.
 - **Virtual device creation:** driver installation, `pnputil`, `devcon`, `SetupDi*`
   install calls, bundled `.inf`/`.sys` files, or bundling/installing VB-Cable.
 
@@ -75,7 +79,8 @@ break their system audio.
 
 Allowed (do not flag): enumerating devices; reading the default playback device
 *only* to compare it with CABLE Input for the warning; opening streams on the two
-explicitly selected devices in shared mode.
+explicitly selected devices in shared mode; the exclusive-mode renderer on the selected
+CABLE Input (by its endpoint ID) with fallback to shared.
 
 ## Output format
 Start with a one-line verdict: `PASS`, `PASS WITH NOTES`, or `FAIL`.

@@ -28,6 +28,9 @@ pub struct Params {
     /// the engine through the normal crossfade.
     pub dfn_postfilter: AtomicBool,
     pub eq: AtomicBool,
+    /// "Hide my voice from screen shares": play CABLE Input in exclusive mode (see
+    /// `exclusive.rs`). Read when streams open; changing it reopens them.
+    pub hide_from_share: AtomicBool,
     /// EQ band gains in dB: body, mud, presence (f32 bits).
     eq_gains: [AtomicU32; 3],
     /// Which preset those gains came from (`EqPreset as u8`), for display.
@@ -128,6 +131,7 @@ impl Params {
             agc_max_db: AtomicU32::new(AGC_MAX_DB_DEFAULT.to_bits()),
             dfn_postfilter: AtomicBool::new(false),
             eq: AtomicBool::new(true),
+            hide_from_share: AtomicBool::new(true),
             eq_gains: [const { AtomicU32::new(0) }; 3], // 0u32 is 0.0f32: Natural
             eq_preset: AtomicU8::new(EqPreset::Natural as u8),
         }

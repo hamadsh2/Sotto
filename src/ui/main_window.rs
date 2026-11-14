@@ -35,6 +35,7 @@ use gpui_component::switch::Switch;
 use gpui_component::{Disableable, IndexPath, Sizable};
 use sotto::control::{EngineKind, Hear};
 use sotto::devices::{Dir, VB_CABLE_URL};
+use sotto::engine::OutputMode;
 use sotto::params::{
     AGC_MAX_DB_MAX, AGC_MAX_DB_MIN, EQ_DB_LIMIT, EqPreset, GATE_DB_MAX, GATE_DB_MIN, Params,
 };
@@ -1479,6 +1480,60 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// "Hide my voice from screen shares": play CABLE Input in exclusive mode, so a
+    /// whole-screen share in Discord doesn't pick your voice up a second time.
+    fn hide_row(&self, st: &Status, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.params.hide_from_share.load(Relaxed);
+        let refused = match &st.output_mode {
+            Some(OutputMode::Shared { refused: Some(why) }) if on => Some(why.clone()),
+            _ => None,
+        };
+        let hint: SharedString = if on {
+            "Viewers of a whole-screen share won't hear your voice twice.".into()
+        } else {
+            "Off: a whole-screen share in Discord also picks up your voice.".into()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(SP_8)
+            .py(SP_12)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(SP_12)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child("Hide my voice from screen shares")
+                            .child(caption(hint)),
+                    )
+                    .child(
+                        div().flex_none().cursor_pointer().child(
+                            Switch::new("hide-from-share")
+                                .checked(on)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    // Set here too, so the save right after sees it.
+                                    this.params.hide_from_share.store(*checked, Relaxed);
+                                    send(Command::SetHide(*checked), cx);
+                                    save_soon(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+            .when_some(refused, |d, why| {
+                d.child(note(format!(
+                    "Couldn't turn this on: {why}. Your voice still goes out normally."
+                )))
+            })
+            .into_any_element()
+    }
+
     /// "Check for updates automatically" (at start and once a day).
     fn auto_update_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let on = cx.global::<AppState>().settings.check_updates;
@@ -2095,7 +2150,7 @@ impl Render for MainWindow {
             warnings.push(
                 warning_card(
                     "CABLE Input is your Windows default playback device, so games and music go into the cable.",
-                    "Fix it in Settings → System → Sound → Output: pick your headphones or speakers. Sotto won't change it for you.",
+                    "Fix it in Settings → System → Sound → Output: pick your headphones or speakers. Sotto won't change it for you. (While \"Hide my voice from screen shares\" is on, their sound is cut off instead.)",
                 )
                 .into_any_element(),
             );
@@ -2168,6 +2223,7 @@ impl Render for MainWindow {
                 st.outputs.is_empty(),
             )
             .into_any_element(),
+            self.hide_row(&st, cx),
         ];
         let readout = |label: &'static str, value: String| {
             div()

@@ -7,12 +7,14 @@
 //!          Sotto's denoise worker thread: 480-sample frame → processing chain
 //!          (high-pass → denoise → gate → auto gain → limiter, see `dsp.rs`)
 //!                                                            │
-//!  CABLE Input ◄─(cpal render thread)─ pull samples ◄─ clean ring
+//!  CABLE Input ◄─(render thread)─ pull samples ◄─ clean ring
 //! ```
 //!
-//! cpal runs each stream's callback on its own high-priority thread (shared-mode WASAPI —
-//! cpal 0.18 hard-codes AUDCLNT_SHAREMODE_SHARED). These callbacks must never allocate,
-//! lock, print, or do I/O: anything slow there is an audible glitch.
+//! The mic is always captured by cpal in shared mode. CABLE Input is played either in
+//! exclusive mode by `exclusive.rs` ("Hide my voice from screen shares", the default:
+//! screen-share loopback capture can't see it) or, if that's off or refused, by cpal in
+//! shared mode (cpal 0.18 hard-codes AUDCLNT_SHAREMODE_SHARED). Audio callbacks must
+//! never allocate, lock, print, or do I/O: anything slow there is an audible glitch.
 //!
 //! Why a separate worker thread for denoising? nnnoiseless sets up its FFT tables the
 //! first time it runs *on each thread* (allocating and leaking a little memory). cpal
@@ -274,10 +276,27 @@ impl Worker {
 /// A running pair of streams. Dropping it stops both (Rust calls `drop` automatically
 /// when the value goes out of scope — like `__exit__` of a `with` block).
 pub struct Engine {
+    // Field order matters: the input stops first, then the output.
     _input: Stream,
-    _output: Stream,
+    _output: Output,
     pub input_channels: u16,
     pub output_channels: u16,
+    pub output_mode: OutputMode,
+}
+
+enum Output {
+    Shared(#[allow(dead_code)] Stream),
+    Exclusive(#[allow(dead_code)] crate::exclusive::Exclusive),
+}
+
+/// How CABLE Input is being played.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OutputMode {
+    /// Hidden from screen shares; the device format, e.g. "24-bit".
+    Exclusive(String),
+    /// Shared mode: heard in whole-screen shares. `refused` says why exclusive mode
+    /// couldn't be used, when it was asked for.
+    Shared { refused: Option<String> },
 }
 
 /// Find a 48 kHz f32 config the device supports natively, preferring fewer channels.
@@ -325,11 +344,14 @@ fn is_recoverable(kind: ErrorKind) -> bool {
 /// Open and start streams on exactly these two devices, feeding `worker`.
 ///
 /// `input` / `output` must come from the `devices` module (enumerated, never default).
+/// With `exclusive`, CABLE Input is tried in exclusive mode first (see `exclusive.rs`),
+/// falling back to shared mode if Windows refuses.
 pub fn start(
     input: &Device,
     output: &Device,
     worker: &Worker,
     stats: Arc<Stats>,
+    exclusive: bool,
 ) -> Result<Engine, String> {
     let in_cfg = pick_config(
         input
@@ -337,14 +359,7 @@ pub fn start(
             .map_err(|e| format!("input device: {e}"))?,
         "The input device",
     )?;
-    let out_cfg = pick_config(
-        output
-            .supported_output_configs()
-            .map_err(|e| format!("output device: {e}"))?,
-        "The output device",
-    )?;
     let in_ch = in_cfg.channels as usize;
-    let out_ch = out_cfg.channels as usize;
 
     // `split` turns a ring buffer into a producer half (only it can push) and a consumer
     // half (only it can pop). Each half lives in exactly one thread — single producer,
@@ -380,7 +395,52 @@ pub fn start(
         }
     };
 
+    // Build the mic stream first (not started yet): if the mic can't be opened, we stop
+    // here without ever taking CABLE Input away from other apps.
+    let in_stream = input
+        .build_input_stream::<f32, _, _>(in_cfg, on_input, on_input_err, TIMEOUT)
+        .map_err(|e| format!("could not open input stream: {e}"))?;
+    let play_input = |s: &Stream| s.play().map_err(|e| format!("could not start input: {e}"));
+
     // ---------------- render side ----------------
+    // Exclusive first (by the selected device's exact endpoint ID), else shared.
+    let mut refused = None;
+    if exclusive {
+        let id = output.id().map_err(|e| format!("output device id: {e}"))?;
+        match crate::exclusive::start(id.id(), clean_cons, Arc::clone(&stats)) {
+            Ok(ex) => {
+                play_input(&in_stream)?;
+                let mode = OutputMode::Exclusive(ex.format.describe());
+                let channels = ex.format.channels;
+                return Ok(Engine {
+                    _input: in_stream,
+                    _output: Output::Exclusive(ex),
+                    input_channels: in_ch as u16,
+                    output_channels: channels,
+                    output_mode: mode,
+                });
+            }
+            Err(r) => {
+                let r = *r;
+                refused = Some(r.why);
+                // Without the ring there's nothing to fall back with; retry later.
+                clean_cons = r.ring.ok_or_else(|| {
+                    format!(
+                        "exclusive output failed: {}",
+                        refused.as_deref().unwrap_or("")
+                    )
+                })?;
+            }
+        }
+    }
+
+    let out_cfg = pick_config(
+        output
+            .supported_output_configs()
+            .map_err(|e| format!("output device: {e}"))?,
+        "The output device",
+    )?;
+    let out_ch = out_cfg.channels as usize;
     let mut renderer = Renderer::new();
     let st = Arc::clone(&stats);
     let on_output = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -393,28 +453,29 @@ pub fn start(
         }
     };
 
-    let timeout = Some(Duration::from_secs(3));
     let out_stream = output
-        .build_output_stream::<f32, _, _>(out_cfg, on_output, on_output_err, timeout)
-        .map_err(|e| format!("could not open output stream: {e}"))?;
-    let in_stream = input
-        .build_input_stream::<f32, _, _>(in_cfg, on_input, on_input_err, timeout)
-        .map_err(|e| format!("could not open input stream: {e}"))?;
-
+        .build_output_stream::<f32, _, _>(out_cfg, on_output, on_output_err, TIMEOUT)
+        .map_err(|e| match &refused {
+            // Shared failed too: the exclusive reason says it in words (e.g. another app
+            // holds CABLE Input exclusively).
+            Some(why) => why.clone(),
+            None => format!("could not open output stream: {e}"),
+        })?;
     out_stream
         .play()
         .map_err(|e| format!("could not start output: {e}"))?;
-    in_stream
-        .play()
-        .map_err(|e| format!("could not start input: {e}"))?;
+    play_input(&in_stream)?;
 
     Ok(Engine {
         _input: in_stream,
-        _output: out_stream,
+        _output: Output::Shared(out_stream),
         input_channels: in_cfg.channels,
         output_channels: out_cfg.channels,
+        output_mode: OutputMode::Shared { refused },
     })
 }
+
+const TIMEOUT: Option<Duration> = Some(Duration::from_secs(3));
 
 /// Render-side state: how much audio to keep queued, and whether we are playing yet.
 ///
@@ -425,7 +486,7 @@ pub fn start(
 /// for the rest of the session. Whenever playback (re)starts, anything queued beyond
 /// the target is dropped, so the delay is always exactly the chosen cushion and never
 /// creeps upward.
-struct Renderer {
+pub(crate) struct Renderer {
     primed: bool,
     target: usize,
     /// Samples played since the last underrun (or the last shrink).
@@ -433,7 +494,7 @@ struct Renderer {
 }
 
 impl Renderer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             primed: false,
             target: TARGET_SAMPLES,
@@ -443,7 +504,7 @@ impl Renderer {
 
     /// Fill one output buffer (`channels` interleaved). Real-time safe: no allocation,
     /// no locks, no I/O — only ring-buffer operations and atomics.
-    fn fill(
+    pub(crate) fn fill(
         &mut self,
         ring: &mut impl Consumer<Item = f32>,
         data: &mut [f32],

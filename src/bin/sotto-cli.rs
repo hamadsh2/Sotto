@@ -55,6 +55,7 @@ Commands (type, then Enter):
   tune apply         use the suggested gate threshold and auto-gain limit
   record             record 5 s of your cleaned voice (into memory only)
   play               play that clip once on your Windows playback device
+  hide on|off        hide your voice from screen shares (exclusive CABLE Input)
   status             show current settings
   stats              show the latest performance line
   report on|off      print that line every second (off = easier typing)
@@ -75,6 +76,8 @@ enum Cmd {
     TuneApply,
     Record,
     Play,
+    /// "Hide my voice from screen shares": exclusive CABLE Input on/off (reopens streams).
+    Hide(bool),
 }
 
 /// Apply one typed command.
@@ -101,6 +104,8 @@ fn handle_command(line: &str, p: &Params) -> Cmd {
         ["tune", "apply"] => return Cmd::TuneApply,
         ["record"] => return Cmd::Record,
         ["play"] => return Cmd::Play,
+        ["hide", "on"] => return Cmd::Hide(true),
+        ["hide", "off"] => return Cmd::Hide(false),
         ["hpf", v] => toggle("hpf", &p.hpf, v),
         ["gate", v @ ("on" | "off")] => toggle("gate", &p.gate, v),
         ["gate", v] => match v.parse::<f32>() {
@@ -384,6 +389,19 @@ fn run() -> Result<(), String> {
                         Ok(()) => println!("> playing the clip once…"),
                         Err(e) => println!("> {e}"),
                     }
+                    continue;
+                }
+                Cmd::Hide(on) => {
+                    ctl.params.hide_from_share.store(on, Relaxed);
+                    ctl.reopen();
+                    println!(
+                        "> {} — reopening streams",
+                        if on {
+                            "hiding your voice from screen shares (exclusive CABLE Input)"
+                        } else {
+                            "shared CABLE Input (heard in whole-screen shares)"
+                        }
+                    );
                     continue;
                 }
                 Cmd::TuneApply => {

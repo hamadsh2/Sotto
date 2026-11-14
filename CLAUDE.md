@@ -53,7 +53,15 @@ Repo: github.com/hamadsh2/Sotto (public). License: GPL-3.0-only.
   is never written to disk.
 - Never change Windows default playback or recording devices; never modify any system
   audio setting (volume, format, enhancements, exclusive-mode flags, etc.).
-- **WASAPI shared mode only**, never exclusive mode, so other apps can still use the mic.
+- **WASAPI shared mode** for every stream, so other apps can still use the mic — with one
+  exception (user-approved 2026-11-14): the **output to VB-Cable "CABLE Input"** may use
+  **exclusive mode** ("Hide my voice from screen shares", on by default). Shared-mode
+  output is captured by process-loopback screen shares (Discord's whole-screen share), so
+  viewers heard the voice twice; exclusive-mode output bypasses the audio engine and is
+  not captured (proven by test). If exclusive fails (device busy, format, Windows policy),
+  fall back to shared at once and say so calmly. Never exclusive on the mic, the
+  headphones, or any other device; never change the device's format or its "allow
+  exclusive control" setting.
 - The app creates no virtual audio devices of its own.
 - If CABLE Input is the Windows default playback device, show a calm warning explaining
   how to fix it manually — never change it automatically.
@@ -69,7 +77,9 @@ Repo: github.com/hamadsh2/Sotto (public). License: GPL-3.0-only.
 
 ## Tech stack
 Only these crates without asking:
-- Audio: `cpal` (WASAPI backend), `ringbuf` (lock-free SPSC between input/output threads)
+- Audio: `cpal` (WASAPI backend), `ringbuf` (lock-free SPSC between input/output threads),
+  `windows` 0.62 (same version cpal uses; only for the exclusive CABLE Input renderer,
+  user-approved 2026-11-14)
 - Denoise: `nnnoiseless` (RNNoise port), DeepFilterNet Rust implementation (`deep_filter`
   / libDF — license and model terms must be verified before bundling)
 - UI: `gpui`, `gpui-component`, `global-hotkey`, `tray-icon`

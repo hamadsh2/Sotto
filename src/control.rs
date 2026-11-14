@@ -23,7 +23,7 @@ use crate::denoise::{Denoiser, Off, Rnnoise};
 use crate::devices::{self, Dir};
 use crate::dfn;
 use crate::dsp::EngineSlot;
-use crate::engine;
+use crate::engine::{self, OutputMode};
 use crate::params::Params;
 use crate::playback::{self, CLIP_SAMPLES};
 use crate::stats::{self, Stats};
@@ -103,7 +103,17 @@ pub struct Controller {
     clip: Option<Vec<f32>>,
     /// The clip playing right now.
     player: Option<playback::Player>,
+    /// When the current streams opened, and how many times exclusive output died soon
+    /// after opening. Two quick deaths and exclusive is set aside (with this reason)
+    /// until the user toggles the setting, so a misbehaving driver can't cause an
+    /// endless reopen loop with no sound.
+    opened_at: Option<Instant>,
+    exclusive_strikes: u32,
+    exclusive_off: Option<String>,
 }
+
+/// Exclusive output that dies sooner than this after opening counts as a strike.
+const EXCLUSIVE_GRACE: Duration = Duration::from_secs(10);
 
 /// Where "Hear yourself" stands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -169,6 +179,9 @@ impl Controller {
             recording: None,
             clip: None,
             player: None,
+            opened_at: None,
+            exclusive_strikes: 0,
+            exclusive_off: None,
         })
     }
 
@@ -308,6 +321,20 @@ impl Controller {
         let in_lost = self.stats.input_failed.load(Relaxed);
         if self.streams.is_some() && (in_lost || self.stats.output_failed.load(Relaxed)) {
             let which = if in_lost { "Microphone" } else { "VB-Cable" };
+            let was_exclusive = matches!(self.output_mode(), Some(OutputMode::Exclusive(_)));
+            if !in_lost && was_exclusive {
+                if self
+                    .opened_at
+                    .is_some_and(|t| t.elapsed() < EXCLUSIVE_GRACE)
+                {
+                    self.exclusive_strikes += 1;
+                } else {
+                    self.exclusive_strikes = 0;
+                }
+                if self.exclusive_strikes >= 2 {
+                    self.exclusive_off = Some("exclusive output kept stopping".into());
+                }
+            }
             self.notes.push(format!(
                 "{which} disconnected — stopping streams and waiting for it to come back."
             ));
@@ -323,13 +350,28 @@ impl Controller {
                     let o = devices::find_chosen(&self.host, Dir::Output, &cable.id, &cable.name)?;
                     self.stats.input_failed.store(false, Relaxed);
                     self.stats.output_failed.store(false, Relaxed);
+                    let exclusive =
+                        self.params.hide_from_share.load(Relaxed) && self.exclusive_off.is_none();
                     let e = devices::no_panic("opening streams", || {
-                        engine::start(&i.device, &o.device, worker, Arc::clone(&self.stats))
+                        engine::start(
+                            &i.device,
+                            &o.device,
+                            worker,
+                            Arc::clone(&self.stats),
+                            exclusive,
+                        )
                     })?;
                     Ok((e, i.id, o.id))
                 });
             match attempt {
-                Ok((e, in_id, out_id)) => {
+                Ok((mut e, in_id, out_id)) => {
+                    if let (Some(why), OutputMode::Shared { refused: r @ None }) =
+                        (&self.exclusive_off, &mut e.output_mode)
+                        && self.params.hide_from_share.load(Relaxed)
+                    {
+                        *r = Some(why.clone());
+                    }
+                    self.opened_at = Some(Instant::now());
                     // Found by its exact name under a new ID: remember the new one.
                     for (slot, id) in [(&mut self.input, in_id), (&mut self.output, out_id)] {
                         if let Some(c) = slot.as_mut() {
@@ -341,8 +383,17 @@ impl Controller {
                     let _ = self.stats.take_buffer_avg();
                     self.stats.gate_open_frames.store(0, Relaxed);
                     self.stats.limit_cdb.store(0, Relaxed);
+                    let mode = match &e.output_mode {
+                        OutputMode::Exclusive(f) => {
+                            format!("exclusive mode, {f}: hidden from screen shares")
+                        }
+                        OutputMode::Shared { refused: None } => "shared mode".to_string(),
+                        OutputMode::Shared { refused: Some(why) } => {
+                            format!("shared mode — couldn't hide from screen shares: {why}")
+                        }
+                    };
                     self.notes.push(format!(
-                        "Streams open: mic {}ch → 48 kHz mono → CABLE {}ch (shared mode)",
+                        "Streams open: mic {}ch → 48 kHz mono → CABLE {}ch ({mode})",
                         e.input_channels, e.output_channels
                     ));
                     self.streams = Some(e);
@@ -357,6 +408,20 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    /// How CABLE Input is being played, while streams run.
+    pub fn output_mode(&self) -> Option<&OutputMode> {
+        self.streams.as_ref().map(|e| &e.output_mode)
+    }
+
+    /// Close and reopen the streams on the next `tick` (e.g. after "Hide my voice from
+    /// screen shares" changed). Stops any recording or playback first.
+    pub fn reopen(&mut self) {
+        self.stop_hear();
+        self.streams = None;
+        self.exclusive_strikes = 0;
+        self.exclusive_off = None;
     }
 
     /// Switch the denoise engine (crossfaded). DeepFilterNet loads here, which blocks

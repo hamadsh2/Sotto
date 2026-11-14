@@ -54,6 +54,8 @@ pub struct Settings {
     pub agc_max_db: f32,
     pub limiter: bool,
     pub dfn_postfilter: bool,
+    /// "Hide my voice from screen shares" (exclusive CABLE Input). On by default.
+    pub hide_from_share: bool,
     pub start_with_windows: bool,
     /// Global mute shortcut as text, e.g. "Ctrl+Alt+M"; empty = none.
     pub mute_hotkey: String,
@@ -79,6 +81,7 @@ impl Default for Settings {
             agc_max_db: 0.0,
             limiter: false,
             dfn_postfilter: false,
+            hide_from_share: true,
             start_with_windows: false,
             mute_hotkey: MUTE_HOTKEY_DEFAULT.into(),
             check_updates: true,
@@ -119,6 +122,7 @@ impl Settings {
         self.agc_max_db = p.agc_max_db();
         self.limiter = p.limiter.load(Relaxed);
         self.dfn_postfilter = p.dfn_postfilter.load(Relaxed);
+        self.hide_from_share = p.hide_from_share.load(Relaxed);
     }
 
     /// Put the saved values into `p`, through the clamping setters.
@@ -136,6 +140,7 @@ impl Settings {
         p.set_agc_max_db(self.agc_max_db);
         p.limiter.store(self.limiter, Relaxed);
         p.dfn_postfilter.store(self.dfn_postfilter, Relaxed);
+        p.hide_from_share.store(self.hide_from_share, Relaxed);
     }
 
     /// Parse TOML and clamp every value into its valid range.
@@ -268,6 +273,7 @@ mod tests {
             agc_max_db: 18.0,
             limiter: false,
             dfn_postfilter: true,
+            hide_from_share: false,
             start_with_windows: true,
             mute_hotkey: "Shift+F9".into(),
             check_updates: false,
