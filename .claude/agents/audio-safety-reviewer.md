@@ -20,7 +20,13 @@ break their system audio.
 ## The rules (from CLAUDE.md — strict)
 - The app touches exactly two devices: the selected input mic and the selected output
   (VB-Cable "CABLE Input").
-- Never open a stream on headphones, speakers, or a DAC. No monitor/playback feature.
+- Never open a *live* stream on headphones, speakers, or a DAC. No live monitoring.
+- One exception (user-approved 2026-11-13), "Hear yourself" clip playback: a short clip
+  of the cleaned voice recorded into memory may be played once, only on the user's
+  click, on the Windows default playback device resolved to its endpoint ID at that
+  moment (then opened by that ID), shared mode, stream closed when the clip ends. Never
+  while recording, never automatic or looping, never to a VB-Audio / Voicemeeter /
+  CABLE device or to Sotto's selected output, never written to disk.
 - Never change Windows default playback/recording devices or any system audio setting.
 - WASAPI shared mode only — never exclusive.
 - The app creates no virtual audio devices.
@@ -34,7 +40,11 @@ break their system audio.
     explicitly chosen by the user and matched by name/ID.
   - Fallback logic like "if selected device not found, use default / first device".
   - Any output stream that is not CABLE Input / the user-selected output.
-  - Any monitor, sidetone, preview, "listen", or test-tone playback path.
+  - Any monitor, sidetone, preview, "listen", or test-tone playback path — except the
+    clip-playback exception above, which must meet every one of its conditions (flag
+    any that is missing: live audio reaching it, playback without a click, looping,
+    a virtual/cable target, a device that follows the default after the click, or a
+    stream left open after the clip).
 - **Default device / system setting changes:** any use of `IPolicyConfig`,
   `SetDefaultEndpoint`, `IAudioEndpointVolume::Set*`, `ISimpleAudioVolume::Set*`,
   `IMMDeviceEnumerator` write paths, registry writes under

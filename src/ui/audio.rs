@@ -26,7 +26,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cpal::DeviceId;
-use sotto::control::{Change, Chosen, Controller, EngineKind};
+use sotto::control::{Change, Chosen, Controller, EngineKind, Hear};
 use sotto::devices::{self, Dir};
 use sotto::params::Params;
 use sotto::settings::SavedDevice;
@@ -83,6 +83,10 @@ pub struct Status {
     pub message: Option<String>,
     /// For the meters (read without any lock).
     pub stats: Option<Arc<Stats>>,
+    /// "Hear yourself": where it stands, how far a recording is, and the last problem.
+    pub hear: Hear,
+    pub hear_progress: f32,
+    pub hear_error: Option<String>,
 }
 
 pub enum Command {
@@ -93,6 +97,14 @@ pub enum Command {
     Select(Dir, String),
     /// Re-read the device lists now (e.g. the window was just shown).
     Refresh,
+    /// "Hear yourself": record 5 s of the cleaned voice into memory.
+    Record,
+    /// Play that clip once on the Windows default playback device.
+    Play,
+    /// Stop recording or playing.
+    StopHear,
+    /// Stop and drop the clip (the window was hidden).
+    ForgetClip,
     Quit,
 }
 
@@ -129,6 +141,8 @@ const LIST_EVERY: Duration = Duration::from_secs(3);
 const TICK_EVERY: Duration = Duration::from_secs(1);
 /// Retry an engine switch this often while another one is still finishing.
 const RETRY_EVERY: Duration = Duration::from_millis(100);
+/// Check a recording / playback this often while one runs.
+const HEAR_EVERY: Duration = Duration::from_millis(50);
 
 impl Audio {
     /// `params` already holds the saved settings.
@@ -268,7 +282,14 @@ fn control_loop(
             pending = change(&mut ctl, want, status);
         }
 
-        let wait = if pending.is_some() {
+        let busy_hear = matches!(ctl.hear(), Hear::Recording | Hear::Playing);
+        if busy_hear {
+            ctl.poll_hear();
+            publish_hear(&mut ctl, status, None);
+        }
+        let wait = if busy_hear {
+            HEAR_EVERY
+        } else if pending.is_some() {
             RETRY_EVERY
         } else {
             next_tick.saturating_duration_since(Instant::now())
@@ -288,6 +309,22 @@ fn control_loop(
             Ok(Command::Refresh) => {
                 next_list = Instant::now() + LIST_EVERY;
                 refresh_lists(&ctl, status);
+            }
+            Ok(Command::Record) => {
+                let r = ctl.record();
+                publish_hear(&mut ctl, status, Some(r));
+            }
+            Ok(Command::Play) => {
+                let r = ctl.play();
+                publish_hear(&mut ctl, status, Some(r));
+            }
+            Ok(Command::StopHear) => {
+                ctl.stop_hear();
+                publish_hear(&mut ctl, status, None);
+            }
+            Ok(Command::ForgetClip) => {
+                ctl.forget_clip();
+                publish_hear(&mut ctl, status, Some(Ok(())));
             }
             Ok(Command::Quit) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
@@ -328,6 +365,26 @@ fn change(ctl: &mut Controller, want: Want, status: &Mutex<Status>) -> Option<Wa
         });
     });
     retry.then_some(want)
+}
+
+/// Share "Hear yourself" state with the window. `result`: the outcome of a click, which
+/// sets or clears the shown problem; `None` keeps it (but a note from the controller,
+/// e.g. a recording that timed out, replaces it).
+fn publish_hear(ctl: &mut Controller, status: &Mutex<Status>, result: Option<Result<(), String>>) {
+    let note = ctl
+        .take_notes()
+        .into_iter()
+        .rfind(|n| n.starts_with("Recording stopped"));
+    let (hear, progress) = (ctl.hear(), ctl.record_progress());
+    set(status, |s| {
+        s.hear = hear;
+        s.hear_progress = progress;
+        match (result, note) {
+            (_, Some(n)) => s.hear_error = Some(n),
+            (Some(r), None) => s.hear_error = r.err(),
+            (None, None) => {}
+        }
+    });
 }
 
 fn publish(ctl: &Controller, status: &Mutex<Status>, waiting_note: &mut String) {

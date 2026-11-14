@@ -38,10 +38,19 @@ Repo: github.com/hamadsh2/Sotto (public). License: GPL-3.0-only.
 4. **Distribution:** updater, GitHub Actions, licenses page, README.
 
 ## Audio isolation rules (STRICT — never violate)
-- The app touches exactly **two devices**: the selected input mic and the selected
-  output (VB-Cable "CABLE Input"). Nothing else.
-- Never open any stream on the user's headphones, speakers, or DAC. No monitor /
-  playback / "listen to yourself" feature of any kind.
+- The app streams on exactly **two devices**: the selected input mic and the selected
+  output (VB-Cable "CABLE Input"). Nothing else — except the one clip-playback
+  exception below.
+- Never open a *live* stream on the user's headphones, speakers, or DAC. No live
+  monitoring / "listen to yourself while talking" of any kind (it doubles your voice in
+  screen shares and recordings).
+- **Clip-playback exception ("Hear yourself", user-approved 2026-11-13):** Sotto may play
+  back a short clip of the *cleaned* voice that was recorded into memory, only when the
+  user clicks Play, once, then close the stream at once. Never while recording, never
+  automatically or on repeat, never to a VB-Audio / Voicemeeter / CABLE device or to the
+  selected Sotto output. The device is the Windows default playback device, resolved to
+  its endpoint ID at the moment of the click; shared mode; no setting is changed. The clip
+  is never written to disk.
 - Never change Windows default playback or recording devices; never modify any system
   audio setting (volume, format, enhancements, exclusive-mode flags, etc.).
 - **WASAPI shared mode only**, never exclusive mode, so other apps can still use the mic.
@@ -50,9 +59,11 @@ Repo: github.com/hamadsh2/Sotto (public). License: GPL-3.0-only.
   how to fix it manually — never change it automatically.
 - Implementation consequences:
   - Open streams only on devices the user explicitly selected (matched by name/ID).
-    Never call `default_output_device()` to obtain a device to open a stream on.
+    Never call `default_output_device()` to obtain a device to open a stream on —
+    except to resolve the clip-playback device above (then opened by its exact ID).
     Reading the default device *only to compare* (for the warning above) is allowed.
-  - Enumerating devices is fine; opening a stream is not, except on the two chosen ones.
+  - Enumerating devices is fine; opening a stream is not, except on the two chosen ones
+    and the clip-playback exception.
   - If the selected output is missing, stop output and report — never fall back to
     another device.
 

@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use sotto::control::{Change, Controller, EngineKind};
+use sotto::control::{Change, Controller, EngineKind, Hear};
 use sotto::params::{EqPreset, Params};
 use sotto::tune::{self, Phase};
 use sotto::{devices, engine, stats};
@@ -53,6 +53,8 @@ Commands (type, then Enter):
   strength 0-100     denoise mix: 0 = original, 100 = fully cleaned
   tune               measure your room and voice (5 s quiet, then 5 s talking)
   tune apply         use the suggested gate threshold and auto-gain limit
+  record             record 5 s of your cleaned voice (into memory only)
+  play               play that clip once on your Windows playback device
   status             show current settings
   stats              show the latest performance line
   report on|off      print that line every second (off = easier typing)
@@ -71,6 +73,8 @@ enum Cmd {
     ShowStatus,
     Tune,
     TuneApply,
+    Record,
+    Play,
 }
 
 /// Apply one typed command.
@@ -95,6 +99,8 @@ fn handle_command(line: &str, p: &Params) -> Cmd {
         ["status"] => return Cmd::ShowStatus,
         ["tune"] => return Cmd::Tune,
         ["tune", "apply"] => return Cmd::TuneApply,
+        ["record"] => return Cmd::Record,
+        ["play"] => return Cmd::Play,
         ["hpf", v] => toggle("hpf", &p.hpf, v),
         ["gate", v @ ("on" | "off")] => toggle("gate", &p.gate, v),
         ["gate", v] => match v.parse::<f32>() {
@@ -319,7 +325,14 @@ fn run() -> Result<(), String> {
         }
 
         // Handle typed commands for up to one second, then report.
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // While recording or playing, come back every 50 ms so the playback stream is
+        // closed as soon as the clip ends.
+        let wait = if matches!(ctl.hear(), Hear::Recording | Hear::Playing) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        };
+        let deadline = Instant::now() + wait;
         let mut quit = false;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -357,6 +370,20 @@ fn run() -> Result<(), String> {
                     tuning = Some(tune::Session::start(Arc::clone(&ctl.stats)));
                     suggestion = None;
                     println!("> tune: stay quiet for 5 s (leave your usual sounds on)…");
+                    continue;
+                }
+                Cmd::Record => {
+                    match ctl.record() {
+                        Ok(()) => println!("> recording 5 s — talk now…"),
+                        Err(e) => println!("> {e}"),
+                    }
+                    continue;
+                }
+                Cmd::Play => {
+                    match ctl.play() {
+                        Ok(()) => println!("> playing the clip once…"),
+                        Err(e) => println!("> {e}"),
+                    }
                     continue;
                 }
                 Cmd::TuneApply => {
@@ -415,6 +442,15 @@ fn run() -> Result<(), String> {
             .is_some_and(|s| started.elapsed() >= Duration::from_secs(s))
         {
             break;
+        }
+
+        let before = ctl.hear();
+        ctl.poll_hear();
+        print_notes(&mut ctl);
+        match (before, ctl.hear()) {
+            (Hear::Recording, Hear::Ready) => println!("> recorded — type \"play\" to hear it"),
+            (Hear::Playing, Hear::Ready) => println!("> played"),
+            _ => {}
         }
 
         if let Some(t) = tuning.as_mut() {

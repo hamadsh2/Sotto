@@ -13,9 +13,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cpal::{DeviceId, Host};
+use ringbuf::traits::{Consumer, Observer, Split};
+use ringbuf::{HeapCons, HeapRb};
 
 use crate::denoise::{Denoiser, Off, Rnnoise};
 use crate::devices::{self, Dir};
@@ -23,6 +25,7 @@ use crate::dfn;
 use crate::dsp::EngineSlot;
 use crate::engine;
 use crate::params::Params;
+use crate::playback::{self, CLIP_SAMPLES};
 use crate::stats::{self, Stats};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -94,7 +97,28 @@ pub struct Controller {
     /// Counts stream (re)openings, so callers can reset clock-drift tracking.
     generation: u64,
     notes: Vec<String>,
+    /// "Hear yourself": a recording in progress (the worker fills the other half).
+    recording: Option<(HeapCons<f32>, Instant)>,
+    /// The last finished recording (48 kHz mono, in memory only).
+    clip: Option<Vec<f32>>,
+    /// The clip playing right now.
+    player: Option<playback::Player>,
 }
+
+/// Where "Hear yourself" stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Hear {
+    #[default]
+    Idle,
+    Recording,
+    /// A clip is ready to play.
+    Ready,
+    Playing,
+}
+
+/// A recording that hasn't filled up this long after starting is given up (e.g. the
+/// mic was unplugged mid-way).
+const RECORD_TIMEOUT: Duration = Duration::from_secs(playback::CLIP_SECONDS as u64 + 3);
 
 impl Controller {
     /// Resolve the two devices by name, remember their exact Windows endpoint IDs, build
@@ -142,6 +166,9 @@ impl Controller {
             lost_reported: false,
             generation: 0,
             notes,
+            recording: None,
+            clip: None,
+            player: None,
         })
     }
 
@@ -395,12 +422,116 @@ impl Controller {
         }
     }
 
+    /// Start recording the next 5 s of what CABLE Input gets (the cleaned voice), into
+    /// memory. Stops any playback first: the clip is never heard while recording.
+    pub fn record(&mut self) -> Result<(), String> {
+        let Some(worker) = self.worker.as_ref() else {
+            return Err("the engine is stopped".into());
+        };
+        if self.streams.is_none() {
+            return Err("The microphone isn't running.".into());
+        }
+        self.player = None;
+        if self.recording.take().is_some() {
+            worker.stop_recording();
+        }
+        // Allocated here, on this thread; the worker only copies into it.
+        let (prod, cons) = HeapRb::<f32>::new(CLIP_SAMPLES).split();
+        worker.record(prod)?;
+        self.recording = Some((cons, Instant::now()));
+        self.clip = None;
+        Ok(())
+    }
+
+    /// Play the recorded clip once on Windows' default playback device (never a
+    /// virtual cable or Sotto's own output). See `playback`.
+    pub fn play(&mut self) -> Result<(), String> {
+        if self.recording.is_some() {
+            return Err("Still recording.".into());
+        }
+        let Some(clip) = self.clip.as_deref() else {
+            return Err("Record a clip first.".into());
+        };
+        self.player = None;
+        let avoid = self.output.as_ref().map(|c| &c.id);
+        let dev = playback::resolve(&self.host, avoid)?;
+        let player = devices::no_panic("starting playback", || playback::play(&dev, clip))?;
+        self.player = Some(player);
+        Ok(())
+    }
+
+    /// Stop recording or playing at once.
+    pub fn stop_hear(&mut self) {
+        self.player = None;
+        if self.recording.take().is_some()
+            && let Some(w) = self.worker.as_ref()
+        {
+            w.stop_recording();
+        }
+    }
+
+    /// Stop, and drop the clip from memory.
+    pub fn forget_clip(&mut self) {
+        self.stop_hear();
+        self.clip = None;
+    }
+
+    /// Call every ~100 ms while `hear()` isn't Idle/Ready: picks up a finished
+    /// recording, closes a finished playback, frees returned rings.
+    pub fn poll_hear(&mut self) {
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        let mut returned = false;
+        while let Ok(ring) = worker.recorded.try_recv() {
+            drop(ring); // freed here, not on the audio path
+            returned = true;
+        }
+        if let Some((cons, started)) = self.recording.as_mut() {
+            if returned && cons.is_full() {
+                let mut clip = vec![0.0f32; CLIP_SAMPLES];
+                let n = cons.pop_slice(&mut clip);
+                clip.truncate(n);
+                self.clip = Some(clip);
+                self.recording = None;
+            } else if started.elapsed() > RECORD_TIMEOUT {
+                self.stop_hear();
+                self.notes
+                    .push("Recording stopped: no audio came through.".to_string());
+            }
+        }
+        if self.player.as_ref().is_some_and(|p| p.is_done()) {
+            self.player = None; // closes the stream
+        }
+    }
+
+    pub fn hear(&self) -> Hear {
+        if self.recording.is_some() {
+            Hear::Recording
+        } else if self.player.is_some() {
+            Hear::Playing
+        } else if self.clip.is_some() {
+            Hear::Ready
+        } else {
+            Hear::Idle
+        }
+    }
+
+    /// 0..=1 through the recording.
+    pub fn record_progress(&self) -> f32 {
+        self.recording
+            .as_ref()
+            .map_or(0.0, |(c, _)| c.occupied_len() as f32 / CLIP_SAMPLES as f32)
+    }
+
     /// Stop streams first, then the worker they feed (same as dropping it).
     pub fn stop(self) {}
 }
 
 impl Drop for Controller {
     fn drop(&mut self) {
+        self.player = None;
+        self.recording = None;
         self.streams = None;
         if let Some(w) = self.worker.take() {
             w.stop();

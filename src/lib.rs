@@ -11,6 +11,7 @@ pub mod engine;
 pub mod eq;
 pub mod instance;
 pub mod params;
+pub mod playback;
 pub mod settings;
 pub mod stats;
 pub mod tune;

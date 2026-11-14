@@ -33,7 +33,7 @@ use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::switch::Switch;
 use gpui_component::{Disableable, IndexPath, Sizable};
-use sotto::control::EngineKind;
+use sotto::control::{EngineKind, Hear};
 use sotto::devices::{Dir, VB_CABLE_URL};
 use sotto::params::{
     AGC_MAX_DB_MAX, AGC_MAX_DB_MIN, EQ_DB_LIMIT, EqPreset, GATE_DB_MAX, GATE_DB_MIN, Params,
@@ -230,6 +230,9 @@ pub struct MainWindow {
     /// Mic too loud / too quiet, checked while the window is visible.
     health: Health,
     hints: Hints,
+    /// "Hear yourself" was used since the window was shown (its clip is dropped from
+    /// memory when the window hides).
+    hear_used: bool,
     /// Set if Windows refused to add/remove the "Start with Windows" entry.
     autostart_error: Option<String>,
     /// The value being typed in (one at a time) and its text box.
@@ -352,7 +355,15 @@ impl MainWindow {
                 let shown = visible.load(Relaxed);
                 let wait = if shown { METER_EVERY } else { HIDDEN_EVERY };
                 cx.background_executor().timer(wait).await;
-                let st = stats_src.lock().ok().and_then(|s| s.stats.clone());
+                let (st, hear_busy) = stats_src
+                    .lock()
+                    .map(|s| {
+                        (
+                            s.stats.clone(),
+                            matches!(s.hear, Hear::Recording | Hear::Playing),
+                        )
+                    })
+                    .unwrap_or((None, false));
                 let alive = this.update(cx, |this, cx| {
                     let now = Instant::now();
                     let dt = now.duration_since(last).as_secs_f32();
@@ -370,6 +381,11 @@ impl MainWindow {
                         this.tuning = None;
                         this.health.reset();
                         this.hints = Hints::default();
+                        // Hiding stops any recording or playback and frees the clip.
+                        if this.hear_used {
+                            this.hear_used = false;
+                            send(Command::ForgetClip, cx);
+                        }
                     }
                     if !visible.load(Relaxed) || this.about {
                         // Hidden (or the About page, which has no meters or readouts):
@@ -384,7 +400,7 @@ impl MainWindow {
                     let moving = this.meter_in.is_moving() || this.meter_out.is_moving();
                     // Draw while moving, one last frame when they come to rest, and
                     // once a second for the readouts.
-                    if was_moving || moving || second {
+                    if was_moving || moving || second || hear_busy {
                         cx.notify();
                     }
                 });
@@ -411,6 +427,7 @@ impl MainWindow {
             tune_applied: false,
             health: Health::default(),
             hints: Hints::default(),
+            hear_used: false,
             autostart_error: None,
             editing: None,
             edit,
@@ -674,6 +691,80 @@ impl MainWindow {
                 .when(running, |d| d.child(div().flex().child(start)))
                 .into_any_element(),
         }
+    }
+
+    /// "Hear yourself": record 5 s of the cleaned voice, then play it back once. Never
+    /// live, so your voice is never doubled in a screen share or recording.
+    fn hear_row(&self, st: &Status, cx: &mut Context<Self>) -> AnyElement {
+        let running = st.state == State::Running;
+        let muted = self.params.muted.load(Relaxed);
+        let click = |cmd: fn() -> Command| {
+            cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
+                this.hear_used = true;
+                send(cmd(), cx);
+                cx.notify();
+            })
+        };
+        let (hint, controls): (SharedString, Div) = match st.hear {
+            Hear::Recording => (
+                "Recording… talk normally.".into(),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(SP_12)
+                    .child(div().flex_1().child(progress_bar(st.hear_progress)))
+                    .child(button("hear-stop", "Cancel", false).on_click(click(|| Command::StopHear))),
+            ),
+            Hear::Playing => (
+                "Playing in your headphones…".into(),
+                div()
+                    .flex()
+                    .child(button("hear-stop", "Stop", false).on_click(click(|| Command::StopHear))),
+            ),
+            Hear::Ready => (
+                "Plays once in your headphones. If you're sharing your screen, viewers hear it too."
+                    .into(),
+                div()
+                    .flex()
+                    .gap(SP_8)
+                    .child(button("hear-play", "Play", true).on_click(click(|| Command::Play)))
+                    .when(running && !muted, |d| {
+                        d.child(
+                            button("hear-record", "Record again", false)
+                                .on_click(click(|| Command::Record)),
+                        )
+                    }),
+            ),
+            Hear::Idle => (
+                if !running {
+                    "Start Sotto with your microphone first.".into()
+                } else if muted {
+                    "Unmute to record.".into()
+                } else {
+                    "Record 5 seconds of what others hear, then play it back once.".into()
+                },
+                div().flex().when(running && !muted, |d| {
+                    d.child(button("hear-record", "Record", true).on_click(click(|| Command::Record)))
+                }),
+            ),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(SP_8)
+            .pt(SP_12)
+            .border_t_1()
+            .border_color(c(BORDER))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child("Hear yourself")
+                    .child(caption(hint)),
+            )
+            .when_some(st.hear_error.clone(), |d, e| d.child(note(e)))
+            .child(controls)
+            .into_any_element()
     }
 
     /// Bring the pickers in line with the control thread's lists and choices.
@@ -1872,14 +1963,14 @@ fn result_line(label: &'static str, now: String, new: String) -> impl IntoElemen
 }
 
 /// A one-line advisory: caption text with a 2px `warning` rule.
-fn note(text: &'static str) -> impl IntoElement {
+fn note(text: impl Into<SharedString>) -> impl IntoElement {
     div()
         .pl(SP_8)
         .border_l_2()
         .border_color(c(WARNING))
         .text_size(px(CAPTION))
         .text_color(c(TEXT_PRIMARY))
-        .child(text)
+        .child(text.into())
 }
 
 /// The engine as the segmented control names it.
@@ -2080,7 +2171,8 @@ impl Render for MainWindow {
                     card("Levels")
                         .gap(SP_12)
                         .child(level_meter("Mic", self.meter_in, running, gate_mark, muted))
-                        .child(level_meter("Output", self.meter_out, running, None, false)),
+                        .child(level_meter("Output", self.meter_out, running, None, false))
+                        .child(self.hear_row(&st, cx)),
                 )
                 .child(list_card(devices))
                 .child(list_card(chain))

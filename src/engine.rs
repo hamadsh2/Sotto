@@ -74,6 +74,11 @@ enum WorkerMsg {
     Attach(HeapCons<f32>, HeapProd<f32>),
     /// Switch to this engine (crossfaded while audio flows).
     SetEngine(EngineSlot, u64),
+    /// "Hear yourself": copy the final output (what CABLE Input gets) into this ring
+    /// until it is full, then hand it back on `recorded`.
+    Record(HeapProd<f32>),
+    /// Stop recording early; the ring comes back on `recorded`.
+    StopRecord,
     Quit,
 }
 
@@ -84,6 +89,9 @@ pub struct Worker {
     /// Engines the worker no longer uses come back here, so they are dropped (and a
     /// model's memory freed) on the main thread, not on the audio path.
     pub retired: mpsc::Receiver<EngineSlot>,
+    /// Recording rings come back here when full or stopped, so they are freed on the
+    /// main thread too.
+    pub recorded: mpsc::Receiver<HeapProd<f32>>,
 }
 
 #[link(name = "kernel32")]
@@ -103,6 +111,7 @@ impl Worker {
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<WorkerMsg>();
         let (ret_tx, retired) = mpsc::channel::<EngineSlot>();
+        let (rec_tx, recorded) = mpsc::channel::<HeapProd<f32>>();
         let thread = thread::Builder::new()
             .name("sotto-denoise".into())
             .spawn(move || {
@@ -126,6 +135,10 @@ impl Worker {
                 // a queue.Queue); `let _` ignores a closed channel at shutdown.
                 let give_back = |slot: EngineSlot| {
                     let _ = ret_tx.send(slot);
+                };
+                let mut rec: Option<HeapProd<f32>> = None;
+                let give_back_rec = |r: HeapProd<f32>| {
+                    let _ = rec_tx.send(r);
                 };
                 loop {
                     match rx.try_recv() {
@@ -156,6 +169,18 @@ impl Worker {
                             }
                             continue; // check for more messages before sleeping
                         }
+                        Ok(WorkerMsg::Record(r)) => {
+                            if let Some(old) = rec.replace(r) {
+                                give_back_rec(old);
+                            }
+                            continue;
+                        }
+                        Ok(WorkerMsg::StopRecord) => {
+                            if let Some(old) = rec.take() {
+                                give_back_rec(old);
+                            }
+                            continue;
+                        }
                         Ok(WorkerMsg::Quit) | Err(mpsc::TryRecvError::Disconnected) => return,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
@@ -177,6 +202,16 @@ impl Worker {
                             } else {
                                 stats.overflows.fetch_add(1, Relaxed);
                             }
+                            // A copy for "Hear yourself" (the ring was allocated on the
+                            // main thread; pushing into it only copies).
+                            if let Some(r) = rec.as_mut() {
+                                r.push_slice(&clean);
+                                if r.is_full()
+                                    && let Some(full) = rec.take()
+                                {
+                                    give_back_rec(full);
+                                }
+                            }
                         }
                     }
                     // Tell the main thread which engine is heard, and when the last
@@ -197,6 +232,7 @@ impl Worker {
             tx,
             thread,
             retired,
+            recorded,
         })
     }
 
@@ -208,6 +244,20 @@ impl Worker {
             .map_err(|_| "denoise thread is not running".to_string())?;
         self.thread.thread().unpark();
         Ok(())
+    }
+
+    /// Start copying the output into `ring` (see `WorkerMsg::Record`).
+    pub fn record(&self, ring: HeapProd<f32>) -> Result<(), String> {
+        self.tx
+            .send(WorkerMsg::Record(ring))
+            .map_err(|_| "denoise thread is not running".to_string())?;
+        self.thread.thread().unpark();
+        Ok(())
+    }
+
+    pub fn stop_recording(&self) {
+        let _ = self.tx.send(WorkerMsg::StopRecord);
+        self.thread.thread().unpark();
     }
 
     pub fn stop(self) {
