@@ -113,7 +113,7 @@ source by [GitHub Actions](.github/workflows/release.yml).
 Each release lists the SHA-256 of every file and includes `SHA256SUMS.txt`. In PowerShell:
 
 ```powershell
-Get-FileHash .\Sotto-0.1.0-setup.exe -Algorithm SHA256
+Get-FileHash .\Sotto-0.2.0-setup.exe -Algorithm SHA256
 ```
 
 The hash must match the one on the release page.

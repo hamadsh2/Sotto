@@ -4,6 +4,8 @@ All notable changes to Sotto. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-14
+
 ### Added
 - **Tune for my room:** a 10-second check (5 s quiet, 5 s talking) that suggests a noise-gate
   threshold and auto-gain limit for your mic and room. Nothing changes until you click Apply.
@@ -11,15 +13,17 @@ All notable changes to Sotto. Versions follow [Semantic Versioning](https://semv
 - **Hear yourself:** record 5 seconds of your cleaned voice, then play it back once in your
   headphones. It's never live, so your voice is never doubled in a screen share or recording
   while you talk. The clip stays in memory only and is never played to a virtual cable.
-- **Hide my voice from screen shares** (on by default): your voice no longer plays twice
-  for viewers of a Discord whole-screen share. Sotto now writes to CABLE Input in WASAPI
-  exclusive mode, which the per-app audio capture used by whole-screen shares can't see
-  (measured: none of it reaches that capture, all of it reaches CABLE Output); turn it off to go back to
-  shared mode (for example if you play a soundboard into CABLE Input).
+- **Hide my voice from screen shares** (on by default): viewers of a Discord whole-screen
+  share no longer hear your voice twice. Sotto now writes to CABLE Input in WASAPI
+  exclusive mode, which the screen share's audio capture can't see (measured: none of it
+  reaches that capture, all of it reaches CABLE Output; confirmed in a real Discord share).
+  Turn it off to go back to shared mode, for example if you play a soundboard into CABLE Input.
 - `sotto-cli`: `tune`, `tune apply`, `record`, `play` and `hide on|off` commands.
 
 ### Changed
 - Auto gain aims for a slightly quieter level (−23 dB instead of −20 dB).
+- The "VB-Cable isn't installed" message, the CLI and the README now give step-by-step
+  install help (download the "New Package" zip, run the setup as administrator, restart).
 
 ## [0.1.0] - 2026-11-11
 
